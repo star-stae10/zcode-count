@@ -10,6 +10,7 @@ function row(over: Partial<ModelStat> = {}): ModelStat {
     input_tokens: 1200,
     output_tokens: 340,
     total_cost_usd: "0.01",
+    unpriced_count: 0,
     ...over,
   };
 }
@@ -19,6 +20,7 @@ const summary = {
   output_tokens: 900,
   total_cost_usd: "0.1234",
   request_count: 7,
+  unpriced_count: 0,
 };
 
 describe("ModelStatsTable", () => {
@@ -41,6 +43,24 @@ describe("ModelStatsTable", () => {
     expect(html).toContain("900");
     expect(html).toContain("$0.1234");
     expect(html).toContain("7");
+  });
+
+  it("shows — for a row when all its requests are unpriced", () => {
+    const html = renderToStaticMarkup(
+      <ModelStatsTable rows={[row({ unpriced_count: 2 })]} summary={summary} />,
+    );
+    expect(html).toContain("—");
+    expect(html).not.toContain("$0.0100");
+    expect(html).toContain("$0.1234");
+  });
+
+  it("shows — for the summary row when all requests are unpriced", () => {
+    const html = renderToStaticMarkup(
+      <ModelStatsTable rows={[row()]} summary={{ ...summary, unpriced_count: 7 }} />,
+    );
+    expect(html).toContain("—");
+    expect(html).not.toContain("$0.1234");
+    expect(html).toContain("$0.0100");
   });
 
   it("omits the summary row when summary is null", () => {

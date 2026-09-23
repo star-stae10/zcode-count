@@ -75,6 +75,7 @@ pub struct ProviderStat {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_cost_usd: String,
+    pub unpriced_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +85,7 @@ pub struct ModelStat {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_cost_usd: String,
+    pub unpriced_count: i64,
 }
 
 pub fn insert_record(conn: &Connection, r: &UsageRecord) -> Result<bool, AppError> {
@@ -211,9 +213,9 @@ pub fn query_logs(conn: &Connection, since: i64, until: i64, provider: Option<&s
     Ok(rows)
 }
 
-fn group_stats(conn: &Connection, key: &str, since: i64, until: i64) -> Result<Vec<(String, i64, i64, i64, String)>, AppError> {
+fn group_stats(conn: &Connection, key: &str, since: i64, until: i64) -> Result<Vec<(String, i64, i64, i64, String, i64)>, AppError> {
     let sql = format!(
-        "SELECT {key}, input_tokens, output_tokens, total_cost_usd
+        "SELECT {key}, input_tokens, output_tokens, total_cost_usd, priced
          FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -223,21 +225,25 @@ fn group_stats(conn: &Connection, key: &str, since: i64, until: i64) -> Result<V
             row.get::<_, i64>(1)?,
             row.get::<_, i64>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
         ))
     })?;
 
-    let mut map: HashMap<String, (i64, i64, i64, Decimal)> = HashMap::new();
+    let mut map: HashMap<String, (i64, i64, i64, Decimal, i64)> = HashMap::new();
     for r in it {
-        let (k, i, o, cost) = r?;
-        let e = map.entry(k).or_insert((0, 0, 0, Decimal::ZERO));
+        let (k, i, o, cost, priced) = r?;
+        let e = map.entry(k).or_insert((0, 0, 0, Decimal::ZERO, 0));
         e.0 += 1;
         e.1 += i;
         e.2 += o;
         e.3 += Decimal::from_str(&cost).unwrap_or(Decimal::ZERO);
+        if priced == 0 {
+            e.4 += 1;
+        }
     }
-    let mut out: Vec<(String, i64, i64, i64, String)> = map
+    let mut out: Vec<(String, i64, i64, i64, String, i64)> = map
         .into_iter()
-        .map(|(k, (c, i, o, cost))| (k, c, i, o, cost.normalize().to_string()))
+        .map(|(k, (c, i, o, cost, unpriced))| (k, c, i, o, cost.normalize().to_string(), unpriced))
         .collect();
     // 按成本（Decimal）降序，避免字符串排序错误
     out.sort_by(|a, b| {
@@ -251,14 +257,28 @@ fn group_stats(conn: &Connection, key: &str, since: i64, until: i64) -> Result<V
 pub fn query_provider_stats(conn: &Connection, since: i64, until: i64) -> Result<Vec<ProviderStat>, AppError> {
     Ok(group_stats(conn, "provider_id", since, until)?
         .into_iter()
-        .map(|(id, c, i, o, cost)| ProviderStat { provider_id: id, request_count: c, input_tokens: i, output_tokens: o, total_cost_usd: cost })
+        .map(|(id, c, i, o, cost, unpriced)| ProviderStat {
+            provider_id: id,
+            request_count: c,
+            input_tokens: i,
+            output_tokens: o,
+            total_cost_usd: cost,
+            unpriced_count: unpriced,
+        })
         .collect())
 }
 
 pub fn query_model_stats(conn: &Connection, since: i64, until: i64) -> Result<Vec<ModelStat>, AppError> {
     Ok(group_stats(conn, "model_id", since, until)?
         .into_iter()
-        .map(|(id, c, i, o, cost)| ModelStat { model_id: id, request_count: c, input_tokens: i, output_tokens: o, total_cost_usd: cost })
+        .map(|(id, c, i, o, cost, unpriced)| ModelStat {
+            model_id: id,
+            request_count: c,
+            input_tokens: i,
+            output_tokens: o,
+            total_cost_usd: cost,
+            unpriced_count: unpriced,
+        })
         .collect())
 }
 
@@ -375,6 +395,25 @@ mod tests {
         insert_record(&c, &rec("b", "m2", 20)).unwrap();
         let rows = query_model_stats(&c, 0, 100).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn group_stats_counts_unpriced() {
+        let c = conn();
+        insert_record(&c, &rec("a", "m1", 10)).unwrap();
+        let mut unpriced = rec("b", "m1", 20);
+        unpriced.priced = false;
+        insert_record(&c, &unpriced).unwrap();
+
+        let models = query_model_stats(&c, 0, 100).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].request_count, 2);
+        assert_eq!(models[0].unpriced_count, 1);
+
+        let providers = query_provider_stats(&c, 0, 100).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].request_count, 2);
+        assert_eq!(providers[0].unpriced_count, 1);
     }
 
     #[test]

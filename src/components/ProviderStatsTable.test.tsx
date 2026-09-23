@@ -10,6 +10,7 @@ function row(over: Partial<ProviderStat> = {}): ProviderStat {
     input_tokens: 1200,
     output_tokens: 340,
     total_cost_usd: "0.01",
+    unpriced_count: 0,
     ...over,
   };
 }
@@ -32,5 +33,20 @@ describe("ProviderStatsTable", () => {
       <ProviderStatsTable rows={[row({ provider_id: "openai" }), row({ provider_id: "anthropic" })]} />,
     );
     expect(html.indexOf("openai")).toBeLessThan(html.indexOf("anthropic"));
+  });
+
+  it("shows — for cost when all requests are unpriced", () => {
+    const html = renderToStaticMarkup(
+      <ProviderStatsTable rows={[row({ unpriced_count: 3 })]} />,
+    );
+    expect(html).toContain("—");
+    expect(html).not.toContain("$0.0100");
+  });
+
+  it("shows cost when at least one request is priced", () => {
+    const html = renderToStaticMarkup(
+      <ProviderStatsTable rows={[row({ unpriced_count: 2 })]} />,
+    );
+    expect(html).toContain("$0.0100");
   });
 });

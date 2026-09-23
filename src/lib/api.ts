@@ -17,10 +17,12 @@ export interface RequestLogRow {
 export interface ProviderStat {
   provider_id: string; request_count: number;
   input_tokens: number; output_tokens: number; total_cost_usd: string;
+  unpriced_count: number;
 }
 export interface ModelStat {
   model_id: string; request_count: number;
   input_tokens: number; output_tokens: number; total_cost_usd: string;
+  unpriced_count: number;
 }
 export interface SyncStatus {
   zcode_found: boolean; pricing_found: boolean;
