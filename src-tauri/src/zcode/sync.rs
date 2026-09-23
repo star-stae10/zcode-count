@@ -30,6 +30,7 @@ struct ZRow {
     cache_read: i64,
     cache_creation: i64,
     session_id: Option<String>,
+    query_source: Option<String>,
 }
 
 pub fn sync(
@@ -101,6 +102,7 @@ pub fn sync(
             first_token_ms: r.first_token_ms,
             status: r.status.clone(),
             session_id: r.session_id.clone(),
+            query_source: r.query_source.clone(),
             created_at: r.started_at,
         };
         if dao::insert_record(conn, &rec)? {
@@ -137,7 +139,7 @@ fn query_rows(conn: &Connection, since: i64) -> Result<Vec<ZRow>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT id, provider_id, model_id, status, started_at, duration_ms,
                 time_to_first_token_ms, input_tokens, output_tokens, reasoning_tokens,
-                cache_read_input_tokens, cache_creation_input_tokens, session_id
+                cache_read_input_tokens, cache_creation_input_tokens, session_id, query_source
          FROM model_usage WHERE started_at >= ?1 ORDER BY started_at ASC",
     )?;
     let it = stmt.query_map([since], |row| {
@@ -155,6 +157,7 @@ fn query_rows(conn: &Connection, since: i64) -> Result<Vec<ZRow>, AppError> {
             cache_read: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
             cache_creation: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
             session_id: row.get(12)?,
+            query_source: row.get(13)?,
         })
     })?;
     let mut out = Vec::new();
@@ -180,12 +183,12 @@ mod tests {
                 time_to_first_token_ms INTEGER, input_tokens INTEGER,
                 output_tokens INTEGER, reasoning_tokens INTEGER,
                 cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
-                session_id TEXT);",
+                session_id TEXT, query_source TEXT);",
         ).unwrap();
         c.execute(
             "INSERT INTO model_usage VALUES
-             ('r1','p1','deepseek-v4-flash','completed',100,1000,200,1000,500,100,800,0,'s1'),
-             ('r2','p1','deepseek-v4-flash-0731','error',200,900,150,2000,0,0,0,0,'s1')",
+             ('r1','p1','deepseek-v4-flash','completed',100,1000,200,1000,500,100,800,0,'s1','main_turn'),
+             ('r2','p1','deepseek-v4-flash-0731','error',200,900,150,2000,0,0,0,0,'s1','main_turn')",
             [],
         ).unwrap();
     }
@@ -226,6 +229,7 @@ mod tests {
         // r1: billable input = 1000-800 = 200 -> 200*0.3/1e6 + 500*1.2/1e6 + 800*0.006/1e6
         let r1row = logs.iter().find(|l| l.request_id == "r1").unwrap();
         assert_eq!(r1row.total_cost_usd, "0.0006648");
+        assert_eq!(r1row.query_source, Some("main_turn".into()));
 
         let _ = std::fs::remove_file(&zpath);
     }
@@ -249,14 +253,14 @@ mod tests {
                 time_to_first_token_ms INTEGER, input_tokens INTEGER,
                 output_tokens INTEGER, reasoning_tokens INTEGER,
                 cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
-                session_id TEXT);",
+                session_id TEXT, query_source TEXT);",
         ).unwrap();
     }
 
     fn insert_usage(path: &std::path::Path, id: &str, started_at: i64) {
         let c = rusqlite::Connection::open(path).unwrap();
         c.execute(
-            "INSERT INTO model_usage VALUES (?1,'p1','deepseek-v4-flash','completed',?2,0,0,1000,0,0,0,0,'s1')",
+            "INSERT INTO model_usage VALUES (?1,'p1','deepseek-v4-flash','completed',?2,0,0,1000,0,0,0,0,'s1','main_turn')",
             rusqlite::params![id, started_at],
         ).unwrap();
     }

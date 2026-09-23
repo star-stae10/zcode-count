@@ -12,6 +12,7 @@ export interface RequestLogRow {
   total_cost_usd: string; priced: boolean;
   duration_ms: number | null; first_token_ms: number | null;
   status: string; started_at: number;
+  query_source: string | null;
 }
 export interface ProviderStat {
   provider_id: string; request_count: number;

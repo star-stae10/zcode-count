@@ -1,7 +1,7 @@
 import { RequestLogRow } from "../lib/api";
 import { formatCost, formatTime } from "../lib/format";
 
-const COLS = ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "用时/首字", "状态"];
+const COLS = ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "用时/首字", "状态", "来源"];
 
 export function RequestLogTable({ rows }: { rows: RequestLogRow[] }) {
   return (
@@ -33,6 +33,7 @@ export function RequestLogTable({ rows }: { rows: RequestLogRow[] }) {
                   {r.status}
                 </span>
               </td>
+              <td className="py-2 pr-4 text-gray-500">{r.query_source ?? "—"}</td>
             </tr>
           ))}
           {rows.length === 0 && (

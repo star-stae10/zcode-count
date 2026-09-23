@@ -12,6 +12,7 @@ pub struct UsageRecord {
     pub app_type: String,
     pub provider_id: String,
     pub model_id: String,
+    pub query_source: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub reasoning_tokens: i64,
@@ -64,6 +65,7 @@ pub struct RequestLogRow {
     pub first_token_ms: Option<i64>,
     pub status: String,
     pub started_at: i64,
+    pub query_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,15 +89,15 @@ pub struct ModelStat {
 pub fn insert_record(conn: &Connection, r: &UsageRecord) -> Result<bool, AppError> {
     let n = conn.execute(
         "INSERT OR IGNORE INTO usage_records (
-            request_id, app_type, provider_id, model_id,
+            request_id, app_type, provider_id, model_id, query_source,
             input_tokens, output_tokens, reasoning_tokens,
             cache_read_tokens, cache_creation_tokens,
             input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd,
             total_cost_usd, priced, started_at, duration_ms, first_token_ms,
             status, session_id, created_at
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
         params![
-            r.request_id, r.app_type, r.provider_id, r.model_id,
+            r.request_id, r.app_type, r.provider_id, r.model_id, r.query_source,
             r.input_tokens, r.output_tokens, r.reasoning_tokens,
             r.cache_read_tokens, r.cache_creation_tokens,
             r.input_cost_usd, r.output_cost_usd, r.cache_read_cost_usd, r.cache_creation_cost_usd,
@@ -168,7 +170,7 @@ pub fn query_logs(conn: &Connection, since: i64, until: i64, provider: Option<&s
     let mut sql = String::from(
         "SELECT request_id, provider_id, model_id, input_tokens, output_tokens,
                 cache_read_tokens, total_cost_usd, priced, duration_ms, first_token_ms,
-                status, started_at
+                status, started_at, query_source
          FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2",
     );
     if provider.is_some() {
@@ -192,6 +194,7 @@ pub fn query_logs(conn: &Connection, since: i64, until: i64, provider: Option<&s
             first_token_ms: row.get(9)?,
             status: row.get(10)?,
             started_at: row.get(11)?,
+            query_source: row.get(12)?,
         })
     };
 
@@ -339,6 +342,7 @@ mod tests {
             first_token_ms: Some(200),
             status: "completed".into(),
             session_id: Some("s1".into()),
+            query_source: Some("main_turn".into()),
             created_at: started,
         }
     }
