@@ -46,6 +46,17 @@ pub fn sync(
     let cursor = dao::get_cursor(conn, &source)?;
     let since = cursor.as_ref().map_or(0, |c| c.last_started_at);
 
+    // mtime 短路：ZCode 库（含 -wal）自上次同步后未变化 → 无需重扫、不写游标。
+    if let Some(c) = &cursor {
+        if mtime != 0 && mtime == c.last_mtime {
+            return Ok(SyncReport {
+                zcode_found: true,
+                last_started_at: c.last_started_at,
+                ..Default::default()
+            });
+        }
+    }
+
     let zconn = Connection::open_with_flags(zcode_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| AppError::Database(format!("打开 ZCode 库失败: {e}")))?;
 
@@ -107,7 +118,8 @@ pub fn sync(
 
 fn max_mtime(path: &Path) -> i64 {
     let mut m = file_mtime(path);
-    let wal = path.with_extension("sqlite-wal");
+    // 不用 with_extension：非 .sqlite 文件名会被拼错，导致漏同步。
+    let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
     m = m.max(file_mtime(&wal));
     m
 }
@@ -267,14 +279,86 @@ mod tests {
         assert_eq!(first.imported, 1);
         assert_eq!(first.last_started_at, 100);
 
+        let src = zpath.to_string_lossy().to_string();
+        let cursor_mtime = crate::db::dao::get_cursor(&conn, &src).unwrap().unwrap().last_mtime;
+
+        // 确保 mtime 变化，从而不会走短路（否则测不到水位线）
+        std::thread::sleep(std::time::Duration::from_millis(10));
         // 同毫秒（100）新增 b，并新增更晚的 c
         insert_usage(&zpath, "b", 100);
         insert_usage(&zpath, "c", 200);
+        assert_ne!(max_mtime(&zpath), cursor_mtime, "mtime 未变化，测试前提不成立");
 
         let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
         assert_eq!(second.imported, 2); // b（同毫秒）与 c 都必须导入
         let logs = crate::db::dao::query_logs(&conn, 0, 1000, None, 100).unwrap();
         assert_eq!(logs.len(), 3);
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    /// 文件未变化（含 -wal）→ 第二次 sync 短路：不重扫、不写游标。
+    #[test]
+    fn unchanged_file_short_circuits() {
+        let dir = std::env::temp_dir().join(format!("zc-test-sc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        setup_zcode(&zpath);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let overrides = HashMap::new();
+
+        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(first.scanned, 2);
+        assert_eq!(first.imported, 2);
+
+        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(second.scanned, 0); // 短路
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.last_started_at, 200);
+
+        let logs = crate::db::dao::query_logs(&conn, 0, 1000, None, 100).unwrap();
+        assert_eq!(logs.len(), 2); // 记录数不变
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    /// 强制走插入路径：改写 ZCode 库使 mtime 变化，重复 request_id 必须被 INSERT OR IGNORE 丢弃。
+    #[test]
+    fn duplicate_request_id_not_reimported() {
+        let dir = std::env::temp_dir().join(format!("zc-test-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        insert_usage(&zpath, "a", 100);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let overrides = HashMap::new();
+
+        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(first.imported, 1);
+
+        let src = zpath.to_string_lossy().to_string();
+        let cursor_mtime = crate::db::dao::get_cursor(&conn, &src).unwrap().unwrap().last_mtime;
+
+        // 改写同一行（request_id 仍为 'a'），并确保 mtime 变化以绕过短路
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let c = rusqlite::Connection::open(&zpath).unwrap();
+        c.execute("UPDATE model_usage SET status='error' WHERE id='a'", []).unwrap();
+        drop(c);
+        assert_ne!(max_mtime(&zpath), cursor_mtime, "mtime 未变化，测试前提不成立");
+
+        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(second.scanned, 1); // 确实走了查询/插入路径
+        assert_eq!(second.imported, 0); // 重复 request_id 未再导入
+        assert_eq!(second.skipped, 1);
+
+        let logs = crate::db::dao::query_logs(&conn, 0, 1000, None, 100).unwrap();
+        assert_eq!(logs.len(), 1); // 记录数不变
 
         let _ = std::fs::remove_file(&zpath);
     }
