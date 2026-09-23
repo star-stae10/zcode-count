@@ -1,51 +1,33 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { useEffect, useState } from "react";
+import { syncUsage, getSummary, Summary, SyncStatus } from "./lib/api";
+import { Range, rangeToWindow } from "./lib/format";
+import { Toolbar } from "./components/Toolbar";
+import { SummaryCards } from "./components/SummaryCards";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+export default function App() {
+  const [range, setRange] = useState<Range>("all");
+  const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+  async function refresh() {
+    setLoading(true);
+    try {
+      const st = await syncUsage();
+      setStatus(st);
+      const { since, until } = rangeToWindow(range);
+      setSummary(await getSummary(since, until));
+    } finally {
+      setLoading(false);
+    }
   }
 
+  useEffect(() => { void refresh(); }, [range]);
+
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+    <div className="min-h-screen bg-gray-50 text-gray-900">
+      <Toolbar range={range} onRange={setRange} status={status} onRefresh={refresh} loading={loading} />
+      <SummaryCards summary={summary} />
+    </div>
   );
 }
-
-export default App;
