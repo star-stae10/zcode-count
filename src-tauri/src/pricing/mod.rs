@@ -2,7 +2,6 @@ pub mod candidates;
 pub mod cost;
 pub mod table;
 
-use crate::error::AppError;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::path::PathBuf;

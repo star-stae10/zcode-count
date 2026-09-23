@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn exact_then_prefix_match() {
-        let mut t = PricingTable::from_rows(vec![
+        let t = PricingTable::from_rows(vec![
             ("deepseek-v4-flash".into(), ModelPricing {
                 input: Decimal::from_str("0.3").unwrap(),
                 output: Decimal::from_str("1.2").unwrap(),

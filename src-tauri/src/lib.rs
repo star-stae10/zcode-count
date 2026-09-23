@@ -1,19 +1,29 @@
+pub mod commands;
 pub mod db;
 pub mod error;
 pub mod pricing;
 pub mod zcode;
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .setup(|app| {
+            let db_path = crate::db::default_db_path();
+            let own = crate::db::OwnDb::open(&db_path).map_err(|e| e.to_string())?;
+            app.manage(std::sync::Mutex::new(crate::commands::AppState { db: own }));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            crate::commands::sync_usage,
+            crate::commands::get_summary,
+            crate::commands::list_logs,
+            crate::commands::get_provider_stats,
+            crate::commands::get_model_stats,
+            crate::commands::set_price_override,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
