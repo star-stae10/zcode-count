@@ -29,6 +29,10 @@ export interface SyncStatus {
   imported: number; skipped: number; unpriced: number;
   last_synced_at: number; last_error: string | null;
 }
+export interface PriceOverride {
+  provider_id: string; model_id: string;
+  input: string; output: string; cache_read: string; cache_creation: string;
+}
 
 export const syncUsage = () => invoke<SyncStatus>("sync_usage");
 export const getSummary = (since: number, until: number) => invoke<Summary>("get_summary", { since, until });
@@ -36,3 +40,10 @@ export const listLogs = (since: number, until: number, provider: string | null, 
   invoke<RequestLogRow[]>("list_logs", { since, until, provider, limit });
 export const getProviderStats = (since: number, until: number) => invoke<ProviderStat[]>("get_provider_stats", { since, until });
 export const getModelStats = (since: number, until: number) => invoke<ModelStat[]>("get_model_stats", { since, until });
+
+// 注意：Tauri v2 参数默认 camelCase 映射到 Rust 的 snake_case。
+export const setPriceOverride = (providerId: string, modelId: string, input: string, output: string, cacheRead: string, cacheCreation: string) =>
+  invoke<number>("set_price_override", { providerId, modelId, input, output, cacheRead, cacheCreation });
+export const listPriceOverrides = () => invoke<PriceOverride[]>("list_price_overrides");
+export const deletePriceOverride = (providerId: string, modelId: string) =>
+  invoke<void>("delete_price_override", { providerId, modelId });

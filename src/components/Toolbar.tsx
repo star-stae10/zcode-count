@@ -13,6 +13,7 @@ export function Toolbar(props: {
   provider: string | null; onProvider: (p: string | null) => void; providers: string[];
   customSince: string; customUntil: string;
   onCustomSince: (v: string) => void; onCustomUntil: (v: string) => void;
+  onOpenPricing: () => void;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 px-4 py-3">
@@ -45,6 +46,10 @@ export function Toolbar(props: {
       <button onClick={props.onRefresh} disabled={props.loading}
         className="rounded bg-gray-800 px-3 py-1 text-sm text-white disabled:opacity-50">
         {props.loading ? "同步中…" : "刷新"}
+      </button>
+      <button onClick={props.onOpenPricing}
+        className="rounded bg-gray-100 px-3 py-1 text-sm text-gray-700">
+        定价覆盖
       </button>
       <span className="text-xs text-gray-500">
         {props.status?.last_synced_at

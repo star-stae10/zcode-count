@@ -7,6 +7,7 @@ import { Tabs, TabId } from "./components/Tabs";
 import { RequestLogTable } from "./components/RequestLogTable";
 import { ProviderStatsTable } from "./components/ProviderStatsTable";
 import { ModelStatsTable } from "./components/ModelStatsTable";
+import { PricingOverrideDialog } from "./components/PricingOverrideDialog";
 
 function todayInput(): string {
   const d = new Date();
@@ -27,6 +28,7 @@ export default function App() {
   const [modelStats, setModelStats] = useState<ModelStat[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pricingOpen, setPricingOpen] = useState(false);
 
   async function refresh() {
     setLoading(true);
@@ -57,7 +59,15 @@ export default function App() {
         providers={providerStats.map((p) => p.provider_id)}
         customSince={customSince} customUntil={customUntil}
         onCustomSince={setCustomSince} onCustomUntil={setCustomUntil}
+        onOpenPricing={() => setPricingOpen(true)}
       />
+      {pricingOpen && (
+        <PricingOverrideDialog
+          providers={providerStats.map((p) => p.provider_id)}
+          onClose={() => setPricingOpen(false)}
+          onChanged={() => void refresh()}
+        />
+      )}
       {error && <div className="px-4 pt-3 text-sm text-red-600">{error}</div>}
       <SummaryCards summary={summary} range={range} />
       <Tabs active={tab} onChange={setTab} />
