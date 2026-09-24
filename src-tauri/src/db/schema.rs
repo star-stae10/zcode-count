@@ -72,8 +72,15 @@ pub fn migrate(conn: &Connection) -> Result<(), AppError> {
     // 旧 pricing_overrides（仅 model_id）→ 新结构 (provider_id, model_id)。
     // 幂等：仅在表已存在且缺 provider_id 列时重建；旧行的 provider_id 置 ''。
     if table_exists(conn, "pricing_overrides")? && !column_exists(conn, "pricing_overrides", "provider_id")? {
-        conn.execute_batch(
-            "ALTER TABLE pricing_overrides RENAME TO pricing_overrides_old;
+        const LEGACY: &str = "pricing_overrides_legacy_v2";
+        // 迁移中断可能留下临时表；先清掉以免 RENAME 冲突。
+        if table_exists(conn, LEGACY)? {
+            conn.execute(&format!("DROP TABLE {LEGACY}"), [])?;
+        }
+        // 整段包在 BEGIN IMMEDIATE 事务里；失败回滚，避免半成品结构。
+        let result = conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE pricing_overrides RENAME TO {LEGACY};
              CREATE TABLE pricing_overrides (
                provider_id TEXT NOT NULL,
                model_id TEXT NOT NULL,
@@ -84,9 +91,14 @@ pub fn migrate(conn: &Connection) -> Result<(), AppError> {
                PRIMARY KEY (provider_id, model_id)
              );
              INSERT INTO pricing_overrides (provider_id, model_id, input_cost_per_million, output_cost_per_million, cache_read_cost_per_million, cache_creation_cost_per_million)
-               SELECT '', model_id, input_cost_per_million, output_cost_per_million, cache_read_cost_per_million, cache_creation_cost_per_million FROM pricing_overrides_old;
-             DROP TABLE pricing_overrides_old;",
-        )?;
+               SELECT '', model_id, input_cost_per_million, output_cost_per_million, cache_read_cost_per_million, cache_creation_cost_per_million FROM {LEGACY};
+             DROP TABLE {LEGACY};
+             COMMIT;"
+        ));
+        if result.is_err() {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+        result?;
     }
 
     Ok(())
@@ -184,6 +196,9 @@ mod tests {
         // 新结构：provider_id 列存在
         assert!(column_exists(&c, "pricing_overrides", "provider_id").unwrap());
         assert!(column_exists(&c, "pricing_overrides", "model_id").unwrap());
+        // 临时表已清理，迁移可重复执行
+        assert!(!table_exists(&c, "pricing_overrides_legacy_v2").unwrap(),
+                "迁移临时表应被 DROP");
 
         // 旧行以 provider_id = '' 保留，单价原样
         let (pid, mid, i): (String, String, String) = c

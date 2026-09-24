@@ -492,6 +492,77 @@ mod tests {
         let _ = std::fs::remove_file(&zpath);
     }
 
+    /// 删除覆盖后：清空该组合成本并重新回填——表里有价 → 回退表价；表里无价 → 变未定价。
+    /// 其它组合的行不受影响。
+    #[test]
+    fn deleting_override_reverts_to_table_or_unpriced() {
+        let dir = std::env::temp_dir().join(format!("zc-test-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        {
+            let c = rusqlite::Connection::open(&zpath).unwrap();
+            c.execute_batch(
+                "INSERT INTO model_usage VALUES
+                 ('r1','p1','m1','completed',100,0,0,1000,0,0,0,0,'s1','main_turn'),
+                 ('r2','p1','m2','completed',200,0,0,1000,0,0,0,0,'s1','main_turn'),
+                 ('r3','p1','m3','completed',300,0,0,1000,0,0,0,0,'s1','main_turn');",
+            ).unwrap();
+        }
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // 表里只有 m1 的价；m2/m3 查不到
+        let table = PricingTable::from_rows(vec![
+            ("m1".into(), ModelPricing { input: Decimal::from_str("0.3").unwrap(), ..pricing_zero() }),
+        ]);
+        let mut overrides = HashMap::new();
+        for m in ["m1", "m2", "m3"] {
+            let p = ModelPricing { input: Decimal::from_str("1.0").unwrap(), ..pricing_zero() };
+            dao::set_override(&conn, "p1", m, &p).unwrap();
+            overrides.insert(("p1".to_string(), m.to_string()), p);
+        }
+        let first = sync(&conn, &zpath, &table, &overrides).unwrap();
+        assert_eq!(first.imported, 3);
+        let cost = |id: &str| {
+            let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+            let r = logs.into_iter().find(|l| l.request_id == id).unwrap();
+            (r.priced, Decimal::from_str(&r.total_cost_usd).unwrap())
+        };
+        for id in ["r1", "r2", "r3"] {
+            let (priced, c) = cost(id);
+            assert!(priced);
+            assert_eq!(c, Decimal::from_str("0.001").unwrap(), "{id} 应为覆盖价");
+        }
+
+        // 删除 (p1,m1) 与 (p1,m2) 的覆盖，并清空其成本后重新同步；保留 (p1,m3)。
+        for m in ["m1", "m2"] {
+            dao::delete_override(&conn, "p1", m).unwrap();
+            let n = dao::clear_pricing_by_provider_model(&conn, "p1", m).unwrap();
+            assert_eq!(n, 1, "组合 (p1,{m}) 应清空 1 行");
+        }
+        let remaining = dao::get_overrides(&conn).unwrap();
+        assert_eq!(remaining.len(), 1, "只剩 (p1,m3) 覆盖");
+        let second = sync(&conn, &zpath, &table, &remaining).unwrap();
+        assert_eq!(second.repriced, 2, "r1 回填表价 + r2 保持未定价不计数；仅 r1 计入");
+
+        // 表里有价 → 回退表价
+        let (priced, c) = cost("r1");
+        assert!(priced, "r1 应回退为表价（priced=1）");
+        assert_eq!(c, Decimal::from_str("0.0003").unwrap());
+        // 表里无价 → 未定价、成本 0
+        let (priced, c) = cost("r2");
+        assert!(!priced, "r2 应变为未定价");
+        assert_eq!(c, Decimal::ZERO);
+        // 其它组合不受影响
+        let (priced, c) = cost("r3");
+        assert!(priced);
+        assert_eq!(c, Decimal::from_str("0.001").unwrap(), "r3 的覆盖仍在，成本不变");
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
     fn pricing_zero() -> ModelPricing {
         ModelPricing {
             input: Decimal::ZERO, output: Decimal::ZERO,

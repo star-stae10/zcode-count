@@ -90,10 +90,15 @@ pub fn set_price_override(
 ) -> Result<u32, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    if provider_id.is_empty() || model_id.is_empty() {
+        return Err("供应商与模型 ID 不能为空".into());
+    }
     let p = crate::pricing::ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation)
         .map_err(|e| format!("单价解析失败: {e}"))?;
     crate::pricing::validate_non_negative(&p)?;
-    dao::set_override(&conn, &provider_id, &model_id, &p).map_err(|e| e.to_string())?;
+    dao::set_override(&conn, provider_id, model_id, &p).map_err(|e| e.to_string())?;
 
     // 保存后立即重算：重读覆盖与定价表再同步。
     let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
@@ -109,11 +114,21 @@ pub fn list_price_overrides(state: State<'_, Mutex<AppState>>) -> Result<Vec<dao
     dao::list_overrides(&conn).map_err(|e| e.to_string())
 }
 
+/// 删除「供应商 + 模型」的覆盖，并让该组合的行重新按当前定价来源回填，返回重算行数。
 #[tauri::command]
 pub fn delete_price_override(
     state: State<'_, Mutex<AppState>>, provider_id: String, model_id: String,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::delete_override(&conn, &provider_id, &model_id).map_err(|e| e.to_string())
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    dao::delete_override(&conn, provider_id, model_id).map_err(|e| e.to_string())?;
+    // 清掉该组合已按覆盖价定过的行（priced=0），使下方 sync 能按当前定价来源回填。
+    dao::clear_pricing_by_provider_model(&conn, provider_id, model_id).map_err(|e| e.to_string())?;
+
+    let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
+    let (pricing, _) = load_pricing();
+    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides).map_err(|e| e.to_string())?;
+    Ok(report.repriced as u32)
 }

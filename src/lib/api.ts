@@ -46,4 +46,4 @@ export const setPriceOverride = (providerId: string, modelId: string, input: str
   invoke<number>("set_price_override", { providerId, modelId, input, output, cacheRead, cacheCreation });
 export const listPriceOverrides = () => invoke<PriceOverride[]>("list_price_overrides");
 export const deletePriceOverride = (providerId: string, modelId: string) =>
-  invoke<void>("delete_price_override", { providerId, modelId });
+  invoke<number>("delete_price_override", { providerId, modelId });

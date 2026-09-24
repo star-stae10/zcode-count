@@ -33,6 +33,7 @@ export function PricingOverrideDialog(props: {
   const [rows, setRows] = useState<PriceOverride[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [confirming, setConfirming] = useState<string | null>(null);
 
   const providerId = providerSel === CUSTOM ? customProvider.trim() : providerSel;
 
@@ -151,20 +152,32 @@ export function PricingOverrideDialog(props: {
               {rows.length === 0 && (
                 <tr><td colSpan={7} className="py-3 text-gray-500">暂无覆盖</td></tr>
               )}
-              {rows.map((r) => (
-                <tr key={`${r.provider_id}/${r.model_id}`} className="border-b border-gray-100">
-                  <td className="py-2 pr-4">{r.provider_id || "（全部）"}</td>
-                  <td className="py-2 pr-4">{r.model_id}</td>
-                  <td className="py-2 pr-4">{r.input}</td>
-                  <td className="py-2 pr-4">{r.output}</td>
-                  <td className="py-2 pr-4">{r.cache_read}</td>
-                  <td className="py-2 pr-4">{r.cache_creation}</td>
-                  <td className="py-2 pr-4">
-                    <button onClick={() => remove(r.provider_id, r.model_id)}
-                      className="rounded bg-red-50 px-2 py-1 text-xs text-red-600">删除</button>
-                  </td>
-                </tr>
-              ))}
+              {rows.map((r) => {
+                const key = `${r.provider_id}/${r.model_id}`;
+                return (
+                  <tr key={key} className="border-b border-gray-100">
+                    <td className="py-2 pr-4">{r.provider_id || "(未指定)"}</td>
+                    <td className="py-2 pr-4">{r.model_id}</td>
+                    <td className="py-2 pr-4">{r.input}</td>
+                    <td className="py-2 pr-4">{r.output}</td>
+                    <td className="py-2 pr-4">{r.cache_read}</td>
+                    <td className="py-2 pr-4">{r.cache_creation}</td>
+                    <td className="py-2 pr-4">
+                      {confirming === key ? (
+                        <span className="flex items-center gap-1">
+                          <button onClick={() => { setConfirming(null); void remove(r.provider_id, r.model_id); }}
+                            className="rounded bg-red-600 px-2 py-1 text-xs text-white">确认删除</button>
+                          <button onClick={() => setConfirming(null)}
+                            className="rounded bg-gray-100 px-2 py-1 text-xs text-gray-700">取消</button>
+                        </span>
+                      ) : (
+                        <button onClick={() => setConfirming(key)}
+                          className="rounded bg-red-50 px-2 py-1 text-xs text-red-600">删除</button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

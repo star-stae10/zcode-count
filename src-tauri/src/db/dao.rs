@@ -449,6 +449,22 @@ pub fn delete_override(conn: &Connection, provider_id: &str, model_id: &str) -> 
     Ok(())
 }
 
+/// 清空某 `(provider_id, model_id)` 组合的成本并置 `priced = 0`，返回受影响行数。
+/// 删除覆盖后调用：让这些行重新按当前定价来源（表价或未定价）回填，避免残留覆盖价。
+pub fn clear_pricing_by_provider_model(
+    conn: &Connection, provider_id: &str, model_id: &str,
+) -> Result<usize, AppError> {
+    let n = conn.execute(
+        "UPDATE usage_records SET
+            input_cost_usd='0', output_cost_usd='0',
+            cache_read_cost_usd='0', cache_creation_cost_usd='0',
+            total_cost_usd='0', priced=0
+         WHERE provider_id = ?1 AND model_id = ?2",
+        params![provider_id, model_id],
+    )?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +616,38 @@ mod tests {
         assert_eq!(rows[0].provider_id, "p2");
         // 删除不存在的键不报错
         delete_override(&c, "nope", "nope").unwrap();
+    }
+
+    #[test]
+    fn clear_pricing_resets_only_target_combo() {
+        let c = conn();
+        let mut a = rec("a", "m1", 10);
+        a.provider_id = "p1".into();
+        let mut b = rec("b", "m1", 20);
+        b.provider_id = "p1".into();
+        let mut other = rec("c", "m1", 30);
+        other.provider_id = "p2".into();
+        insert_record(&c, &a).unwrap();
+        insert_record(&c, &b).unwrap();
+        insert_record(&c, &other).unwrap();
+
+        let n = clear_pricing_by_provider_model(&c, "p1", "m1").unwrap();
+        assert_eq!(n, 2, "应命中该组合 2 行");
+
+        let logs = query_logs(&c, 0, i64::MAX, None, 100).unwrap();
+        for id in ["a", "b"] {
+            let row = logs.iter().find(|l| l.request_id == id).unwrap();
+            assert!(!row.priced, "{id} 应变为未定价");
+            assert_eq!(row.total_cost_usd, "0");
+        }
+        // 其它组合不受影响
+        let other_row = logs.iter().find(|l| l.request_id == "c").unwrap();
+        assert!(other_row.priced);
+        assert_ne!(other_row.total_cost_usd, "0");
+
+        // 再次清空：已 priced=0，仍返回受影响行数（UPDATE 匹配行数）
+        assert_eq!(clear_pricing_by_provider_model(&c, "p1", "m1").unwrap(), 2);
+        assert_eq!(clear_pricing_by_provider_model(&c, "nope", "nope").unwrap(), 0);
     }
 
     #[test]
