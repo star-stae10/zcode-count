@@ -1,4 +1,4 @@
-export type Range = "all" | "today" | "7d" | "30d";
+export type Range = "all" | "today" | "7d" | "30d" | "custom";
 
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -31,7 +31,12 @@ export function formatTime(ms: number): string {
   return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-export function rangeToWindow(range: Range): { since: number; until: number } {
+export function rangeToWindow(range: Range, customSince?: string, customUntil?: string): { since: number; until: number } {
+  if (range === "custom") {
+    if (!customSince || !customUntil) return { since: 0, until: Date.now() };
+    // 本地日零点 → 次日零点（含结束日整天）。
+    return { since: dateStart(customSince), until: dateEndExclusive(customUntil) };
+  }
   const until = Date.now();
   if (range === "all") return { since: 0, until };
   const now = new Date();
@@ -43,4 +48,26 @@ export function rangeToWindow(range: Range): { since: number; until: number } {
     since = until - days * 24 * 60 * 60 * 1000;
   }
   return { since, until };
+}
+
+export function rangeLabel(range: Range): string {
+  switch (range) {
+    case "all": return "全部";
+    case "today": return "当天";
+    case "7d": return "7 天";
+    case "30d": return "30 天";
+    case "custom": return "自定义";
+  }
+}
+
+/** 把 "YYYY-MM-DD" 解析为本地日零点毫秒。 */
+function dateStart(s: string): number {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d).getTime();
+}
+
+/** "YYYY-MM-DD" 次日本地零点毫秒（作为含结束日的上界）。 */
+function dateEndExclusive(s: string): number {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(y, m - 1, d + 1).getTime();
 }

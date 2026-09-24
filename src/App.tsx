@@ -8,8 +8,17 @@ import { RequestLogTable } from "./components/RequestLogTable";
 import { ProviderStatsTable } from "./components/ProviderStatsTable";
 import { ModelStatsTable } from "./components/ModelStatsTable";
 
+function todayInput(): string {
+  const d = new Date();
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 export default function App() {
   const [range, setRange] = useState<Range>("all");
+  const [provider, setProvider] = useState<string | null>(null);
+  const [customSince, setCustomSince] = useState(todayInput());
+  const [customUntil, setCustomUntil] = useState(todayInput());
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [tab, setTab] = useState<TabId>("logs");
@@ -24,9 +33,9 @@ export default function App() {
     try {
       const st = await syncUsage();
       setStatus(st);
-      const { since, until } = rangeToWindow(range);
+      const { since, until } = rangeToWindow(range, customSince, customUntil);
       setSummary(await getSummary(since, until));
-      setLogs(await listLogs(since, until, null, 500));
+      setLogs(await listLogs(since, until, provider, 500));
       setProviderStats(await getProviderStats(since, until));
       setModelStats(await getModelStats(since, until));
       setError(null);
@@ -37,13 +46,20 @@ export default function App() {
     }
   }
 
-  useEffect(() => { void refresh(); }, [range]);
+  useEffect(() => { void refresh(); }, [range, provider, customSince, customUntil]);
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900">
-      <Toolbar range={range} onRange={setRange} status={status} onRefresh={refresh} loading={loading} />
+      <Toolbar
+        range={range} onRange={setRange}
+        status={status} onRefresh={refresh} loading={loading}
+        provider={provider} onProvider={setProvider}
+        providers={providerStats.map((p) => p.provider_id)}
+        customSince={customSince} customUntil={customUntil}
+        onCustomSince={setCustomSince} onCustomUntil={setCustomUntil}
+      />
       {error && <div className="px-4 pt-3 text-sm text-red-600">{error}</div>}
-      <SummaryCards summary={summary} />
+      <SummaryCards summary={summary} range={range} />
       <Tabs active={tab} onChange={setTab} />
       {tab === "logs" && <RequestLogTable rows={logs} />}
       {tab === "providers" && <ProviderStatsTable rows={providerStats} />}

@@ -4,14 +4,18 @@ import { SyncStatus } from "../lib/api";
 const RANGES: { id: Range; label: string }[] = [
   { id: "all", label: "全部" }, { id: "today", label: "当天" },
   { id: "7d", label: "7 天" }, { id: "30d", label: "30 天" },
+  { id: "custom", label: "自定义" },
 ];
 
 export function Toolbar(props: {
   range: Range; onRange: (r: Range) => void;
   status: SyncStatus | null; onRefresh: () => void; loading: boolean;
+  provider: string | null; onProvider: (p: string | null) => void; providers: string[];
+  customSince: string; customUntil: string;
+  onCustomSince: (v: string) => void; onCustomUntil: (v: string) => void;
 }) {
   return (
-    <div className="flex items-center gap-3 border-b border-gray-200 px-4 py-3">
+    <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 px-4 py-3">
       <div className="flex gap-1">
         {RANGES.map((r) => (
           <button key={r.id}
@@ -21,6 +25,23 @@ export function Toolbar(props: {
           </button>
         ))}
       </div>
+      {props.range === "custom" && (
+        <div className="flex items-center gap-2">
+          <input type="date" value={props.customSince}
+            onChange={(e) => props.onCustomSince(e.target.value)}
+            className="rounded border border-gray-300 px-2 py-1 text-sm" />
+          <span className="text-xs text-gray-400">至</span>
+          <input type="date" value={props.customUntil}
+            onChange={(e) => props.onCustomUntil(e.target.value)}
+            className="rounded border border-gray-300 px-2 py-1 text-sm" />
+        </div>
+      )}
+      <select value={props.provider ?? ""}
+        onChange={(e) => props.onProvider(e.target.value || null)}
+        className="rounded border border-gray-300 px-2 py-1 text-sm">
+        <option value="">全部供应商</option>
+        {props.providers.map((p) => <option key={p} value={p}>{p}</option>)}
+      </select>
       <button onClick={props.onRefresh} disabled={props.loading}
         className="rounded bg-gray-800 px-3 py-1 text-sm text-white disabled:opacity-50">
         {props.loading ? "同步中…" : "刷新"}
