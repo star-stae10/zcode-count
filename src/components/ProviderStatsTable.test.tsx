@@ -43,10 +43,10 @@ describe("ProviderStatsTable", () => {
     expect(html).not.toContain("$0.0100");
   });
 
-  it("shows cost when at least one request is priced", () => {
+  it("shows ≥ cost when only some requests are priced", () => {
     const html = renderToStaticMarkup(
       <ProviderStatsTable rows={[row({ unpriced_count: 2 })]} />,
     );
-    expect(html).toContain("$0.0100");
+    expect(html).toContain("≥ $0.0100");
   });
 });

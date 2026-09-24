@@ -13,6 +13,18 @@ export function formatCost(usd: string, priced: boolean): string {
   return `$${v.toFixed(4)}`;
 }
 
+/**
+ * 成本三态显示（处理部分未定价导致的低估）：
+ * - 无未定价 → `$X`
+ * - 全部未定价 → `—`
+ * - 部分未定价 → `≥ $X`（真实值不低于 X）
+ */
+export function formatCostWithUnpriced(usd: string, unpriced: number, total: number): string {
+  if (unpriced > 0 && unpriced >= total) return "—";
+  const base = formatCost(usd, true);
+  return unpriced > 0 ? `≥ ${base}` : base;
+}
+
 export function formatTime(ms: number): string {
   const d = new Date(ms);
   const p = (x: number) => String(x).padStart(2, "0");

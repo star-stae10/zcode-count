@@ -1,5 +1,5 @@
 import { ProviderStat } from "../lib/api";
-import { formatTokens, formatCost } from "../lib/format";
+import { formatTokens, formatCostWithUnpriced } from "../lib/format";
 
 export function ProviderStatsTable({ rows }: { rows: ProviderStat[] }) {
   return (
@@ -21,7 +21,7 @@ export function ProviderStatsTable({ rows }: { rows: ProviderStat[] }) {
               <td className="py-2 pr-4">{r.request_count}</td>
               <td className="py-2 pr-4">{formatTokens(r.input_tokens)}</td>
               <td className="py-2 pr-4">{formatTokens(r.output_tokens)}</td>
-              <td className="py-2 pr-4 font-medium">{formatCost(r.total_cost_usd, r.unpriced_count < r.request_count)}</td>
+              <td className="py-2 pr-4 font-medium">{formatCostWithUnpriced(r.total_cost_usd, r.unpriced_count, r.request_count)}</td>
             </tr>
           ))}
         </tbody>

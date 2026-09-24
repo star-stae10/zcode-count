@@ -1,5 +1,5 @@
 import { ModelStat } from "../lib/api";
-import { formatTokens, formatCost } from "../lib/format";
+import { formatTokens, formatCostWithUnpriced } from "../lib/format";
 
 export function ModelStatsTable({ rows, summary }: {
   rows: ModelStat[];
@@ -25,7 +25,7 @@ export function ModelStatsTable({ rows, summary }: {
               <td className="py-2 pr-4">{summary.request_count}</td>
               <td className="py-2 pr-4">{formatTokens(summary.input_tokens)}</td>
               <td className="py-2 pr-4">{formatTokens(summary.output_tokens)}</td>
-              <td className="py-2 pr-4">{formatCost(summary.total_cost_usd, summary.unpriced_count < summary.request_count)}</td>
+              <td className="py-2 pr-4">{formatCostWithUnpriced(summary.total_cost_usd, summary.unpriced_count, summary.request_count)}</td>
             </tr>
           )}
           {sorted.map((r) => (
@@ -34,7 +34,7 @@ export function ModelStatsTable({ rows, summary }: {
               <td className="py-2 pr-4">{r.request_count}</td>
               <td className="py-2 pr-4">{formatTokens(r.input_tokens)}</td>
               <td className="py-2 pr-4">{formatTokens(r.output_tokens)}</td>
-              <td className="py-2 pr-4 font-medium">{formatCost(r.total_cost_usd, r.unpriced_count < r.request_count)}</td>
+              <td className="py-2 pr-4 font-medium">{formatCostWithUnpriced(r.total_cost_usd, r.unpriced_count, r.request_count)}</td>
             </tr>
           ))}
         </tbody>

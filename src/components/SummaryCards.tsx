@@ -1,5 +1,5 @@
 import { Summary } from "../lib/api";
-import { formatTokens, formatCost } from "../lib/format";
+import { formatTokens, formatCostWithUnpriced } from "../lib/format";
 
 function Card({ label, value }: { label: string; value: string }) {
   return (
@@ -19,7 +19,7 @@ export function SummaryCards({ summary }: { summary: Summary | null }) {
       <Card label="输出" value={formatTokens(summary.output_tokens)} />
       <Card label="缓存读取" value={formatTokens(summary.cache_read_tokens)} />
       <Card label="请求数" value={String(summary.request_count)} />
-      <Card label="总成本" value={formatCost(summary.total_cost_usd, summary.unpriced_count < summary.request_count)} />
+      <Card label="总成本" value={formatCostWithUnpriced(summary.total_cost_usd, summary.unpriced_count, summary.request_count)} />
     </div>
   );
 }
