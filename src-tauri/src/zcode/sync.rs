@@ -6,12 +6,19 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// 查询起点相对游标回退的重叠窗口。ZCode 在请求**完成时**才写入 `model_usage`
+/// 行，而 `started_at` 是请求**开始**时间；长请求可能在同步之后才入库，其
+/// `started_at` 早于水位线。回退该窗口后配合 `INSERT OR IGNORE` 幂等，可避免
+/// 「完成晚于同步」的请求被永久漏计。
+const SYNC_OVERLAP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SyncReport {
     pub scanned: i64,
     pub imported: i64,
     pub skipped: i64,
     pub unpriced: i64,
+    pub repriced: i64,
     pub last_started_at: i64,
     pub zcode_found: bool,
 }
@@ -45,76 +52,97 @@ pub fn sync(
     let source = zcode_path.to_string_lossy().to_string();
     let mtime = max_mtime(zcode_path);
     let cursor = dao::get_cursor(conn, &source)?;
-    let since = cursor.as_ref().map_or(0, |c| c.last_started_at);
+    // 回退重叠窗口：捕获「完成晚于同步」、started_at 已落到水位线之前的请求。
+    let since = cursor
+        .as_ref()
+        .map_or(0, |c| c.last_started_at.saturating_sub(SYNC_OVERLAP_MS));
 
-    // mtime 短路：ZCode 库（含 -wal）自上次同步后未变化 → 无需重扫、不写游标。
-    if let Some(c) = &cursor {
-        if mtime != 0 && mtime == c.last_mtime {
-            return Ok(SyncReport {
-                zcode_found: true,
-                last_started_at: c.last_started_at,
-                ..Default::default()
-            });
+    // mtime 短路：ZCode 库（含 -wal）自上次同步后未变化 → 不重扫、不写游标。
+    // 但仍要执行下方的重定价 pass（定价来源可能在两次同步之间变化）。
+    let short_circuit = cursor.as_ref().map_or(false, |c| mtime != 0 && mtime == c.last_mtime);
+
+    let mut report = SyncReport { zcode_found: true, ..Default::default() };
+
+    if short_circuit {
+        report.last_started_at = cursor.as_ref().map_or(0, |c| c.last_started_at);
+    } else {
+        let zconn = Connection::open_with_flags(zcode_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| AppError::Database(format!("打开 ZCode 库失败: {e}")))?;
+
+        let rows = query_rows(&zconn, since)?;
+        report.scanned = rows.len() as i64;
+        // 从当前水位线起步，避免在「窗口内无新行」时把游标回退。
+        let mut max_started = cursor.as_ref().map_or(0, |c| c.last_started_at);
+
+        for r in &rows {
+            if r.started_at > max_started {
+                max_started = r.started_at;
+            }
+            let cost = resolve(&r.model_id, pricing, overrides)
+                .map(|p| calculate_cache_inclusive(r.input_tokens, r.output_tokens, r.cache_read, r.cache_creation, &p));
+            let priced = cost.is_some();
+            if !priced {
+                report.unpriced += 1;
+            }
+            let (ic, oc, crc, ccc, tc) = match &cost {
+                Some(c) => (c.input_cost.to_string(), c.output_cost.to_string(),
+                            c.cache_read_cost.to_string(), c.cache_creation_cost.to_string(),
+                            c.total_cost.to_string()),
+                None => ("0".into(), "0".into(), "0".into(), "0".into(), "0".into()),
+            };
+            let rec = UsageRecord {
+                request_id: r.id.clone(),
+                app_type: "zcode".into(),
+                provider_id: r.provider_id.clone(),
+                model_id: r.model_id.clone(),
+                input_tokens: r.input_tokens,
+                output_tokens: r.output_tokens,
+                reasoning_tokens: r.reasoning_tokens,
+                cache_read_tokens: r.cache_read,
+                cache_creation_tokens: r.cache_creation,
+                input_cost_usd: ic,
+                output_cost_usd: oc,
+                cache_read_cost_usd: crc,
+                cache_creation_cost_usd: ccc,
+                total_cost_usd: tc,
+                priced,
+                started_at: r.started_at,
+                duration_ms: r.duration_ms,
+                first_token_ms: r.first_token_ms,
+                status: r.status.clone(),
+                session_id: r.session_id.clone(),
+                query_source: r.query_source.clone(),
+                created_at: r.started_at,
+            };
+            if dao::insert_record(conn, &rec)? {
+                report.imported += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        dao::set_cursor(conn, &source, max_started, mtime, now)?;
+        report.last_started_at = max_started;
+    }
+
+    // 重定价 pass：修复已导入但当时无定价的行（priced=0）。定价来源稍后可用时补算成本。
+    if !pricing.is_empty() {
+        for r in dao::query_unpriced_records(conn)? {
+            if let Some(p) = resolve(&r.model_id, pricing, overrides) {
+                let c = calculate_cache_inclusive(
+                    r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens, &p);
+                dao::update_record_pricing(
+                    conn, &r.request_id,
+                    &c.input_cost.to_string(), &c.output_cost.to_string(),
+                    &c.cache_read_cost.to_string(), &c.cache_creation_cost.to_string(),
+                    &c.total_cost.to_string(),
+                )?;
+                report.repriced += 1;
+            }
         }
     }
 
-    let zconn = Connection::open_with_flags(zcode_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| AppError::Database(format!("打开 ZCode 库失败: {e}")))?;
-
-    let rows = query_rows(&zconn, since)?;
-    let mut report = SyncReport { zcode_found: true, scanned: rows.len() as i64, ..Default::default() };
-    let mut max_started = since;
-
-    for r in &rows {
-        if r.started_at > max_started {
-            max_started = r.started_at;
-        }
-        let cost = resolve(&r.model_id, pricing, overrides)
-            .map(|p| calculate_cache_inclusive(r.input_tokens, r.output_tokens, r.cache_read, r.cache_creation, &p));
-        let priced = cost.is_some();
-        if !priced {
-            report.unpriced += 1;
-        }
-        let (ic, oc, crc, ccc, tc) = match &cost {
-            Some(c) => (c.input_cost.to_string(), c.output_cost.to_string(),
-                        c.cache_read_cost.to_string(), c.cache_creation_cost.to_string(),
-                        c.total_cost.to_string()),
-            None => ("0".into(), "0".into(), "0".into(), "0".into(), "0".into()),
-        };
-        let rec = UsageRecord {
-            request_id: r.id.clone(),
-            app_type: "zcode".into(),
-            provider_id: r.provider_id.clone(),
-            model_id: r.model_id.clone(),
-            input_tokens: r.input_tokens,
-            output_tokens: r.output_tokens,
-            reasoning_tokens: r.reasoning_tokens,
-            cache_read_tokens: r.cache_read,
-            cache_creation_tokens: r.cache_creation,
-            input_cost_usd: ic,
-            output_cost_usd: oc,
-            cache_read_cost_usd: crc,
-            cache_creation_cost_usd: ccc,
-            total_cost_usd: tc,
-            priced,
-            started_at: r.started_at,
-            duration_ms: r.duration_ms,
-            first_token_ms: r.first_token_ms,
-            status: r.status.clone(),
-            session_id: r.session_id.clone(),
-            query_source: r.query_source.clone(),
-            created_at: r.started_at,
-        };
-        if dao::insert_record(conn, &rec)? {
-            report.imported += 1;
-        } else {
-            report.skipped += 1;
-        }
-    }
-
-    let now = chrono::Utc::now().timestamp_millis();
-    dao::set_cursor(conn, &source, max_started, mtime, now)?;
-    report.last_started_at = max_started;
     Ok(report)
 }
 
@@ -297,6 +325,83 @@ mod tests {
         assert_eq!(second.imported, 2); // b（同毫秒）与 c 都必须导入
         let logs = crate::db::dao::query_logs(&conn, 0, 1000, None, 100).unwrap();
         assert_eq!(logs.len(), 3);
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    /// 「完成晚于同步」的请求：ZCode 在请求完成时才写 `model_usage` 行，
+    /// 其 `started_at` 可能早于水位线。查询起点必须回退 `SYNC_OVERLAP_MS`，
+    /// 否则该行永久漏计。
+    #[test]
+    fn late_completed_request_before_watermark_is_imported() {
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+        let dir = std::env::temp_dir().join(format!("zc-test-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        let first_started = 100 * DAY;
+        insert_usage(&zpath, "first", first_started);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let overrides = HashMap::new();
+
+        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.last_started_at, first_started);
+
+        let src = zpath.to_string_lossy().to_string();
+        let cursor_mtime = crate::db::dao::get_cursor(&conn, &src).unwrap().unwrap().last_mtime;
+
+        // 模拟「完成晚于同步」：插入一行 started_at 早于水位线、但此刻才出现的请求。
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        insert_usage(&zpath, "late", first_started - 3 * DAY);
+        assert_ne!(max_mtime(&zpath), cursor_mtime, "mtime 未变化，测试前提不成立");
+
+        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert!(second.imported >= 1, "早于水位线的迟到行必须被导入，imported={}", second.imported);
+        let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        assert!(logs.iter().any(|l| l.request_id == "late"), "query_logs 应能查到迟到行");
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    /// 已导入的 `priced=0` 行，在定价稍后可用时必须被重定价
+    /// （即使 ZCode 库自上次同步后未变化、走 mtime 短路）。
+    #[test]
+    fn unpriced_rows_are_repriced_when_pricing_appears() {
+        let dir = std::env::temp_dir().join(format!("zc-test-reprice-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        insert_usage(&zpath, "r", 1000);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let overrides = HashMap::new();
+
+        // 第一次：无定价表 → 行 priced=0
+        let empty = PricingTable::from_rows(vec![]);
+        let first = sync(&conn, &zpath, &empty, &overrides).unwrap();
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.unpriced, 1);
+
+        let before = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        let b = before.iter().find(|l| l.request_id == "r").unwrap();
+        assert!(!b.priced);
+        assert_eq!(b.total_cost_usd, "0");
+
+        // 第二次：定价可用；ZCode 库未变化（mtime 短路），重定价仍须执行。
+        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(second.repriced, 1, "应重定价 1 行");
+
+        let after = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        let r = after.iter().find(|l| l.request_id == "r").unwrap();
+        assert!(r.priced);
+        // input=1000, output=0, cache_read=0 → 1000*0.3/1e6 = 0.0003
+        assert_eq!(r.total_cost_usd, "0.0003");
 
         let _ = std::fs::remove_file(&zpath);
     }

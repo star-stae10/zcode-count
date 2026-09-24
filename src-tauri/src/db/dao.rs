@@ -110,6 +110,54 @@ pub fn insert_record(conn: &Connection, r: &UsageRecord) -> Result<bool, AppErro
     Ok(n > 0)
 }
 
+/// 已导入但尚未定价（`priced = 0`）的记录，用于定价稍后可用时重定价。
+pub struct UnpricedRecord {
+    pub request_id: String,
+    pub model_id: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+pub fn query_unpriced_records(conn: &Connection) -> Result<Vec<UnpricedRecord>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT request_id, model_id, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens
+         FROM usage_records WHERE priced = 0",
+    )?;
+    let it = stmt.query_map([], |row| {
+        Ok(UnpricedRecord {
+            request_id: row.get(0)?,
+            model_id: row.get(1)?,
+            input_tokens: row.get(2)?,
+            output_tokens: row.get(3)?,
+            cache_read_tokens: row.get(4)?,
+            cache_creation_tokens: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
+}
+
+/// 命中定价后回填成本并把 `priced` 置 1。
+pub fn update_record_pricing(
+    conn: &Connection, request_id: &str,
+    input_cost_usd: &str, output_cost_usd: &str,
+    cache_read_cost_usd: &str, cache_creation_cost_usd: &str,
+    total_cost_usd: &str,
+) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE usage_records SET input_cost_usd=?2, output_cost_usd=?3,
+            cache_read_cost_usd=?4, cache_creation_cost_usd=?5,
+            total_cost_usd=?6, priced=1 WHERE request_id=?1",
+        params![request_id, input_cost_usd, output_cost_usd,
+                cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd],
+    )?;
+    Ok(())
+}
+
 pub fn get_cursor(conn: &Connection, source: &str) -> Result<Option<Cursor>, AppError> {
     Ok(conn
         .query_row(
