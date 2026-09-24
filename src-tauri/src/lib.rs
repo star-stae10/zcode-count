@@ -23,6 +23,8 @@ pub fn run() {
             crate::commands::get_provider_stats,
             crate::commands::get_model_stats,
             crate::commands::set_price_override,
+            crate::commands::list_price_overrides,
+            crate::commands::delete_price_override,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

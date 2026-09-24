@@ -20,22 +20,26 @@ pub struct SyncStatus {
     pub last_error: Option<String>,
 }
 
-#[tauri::command]
-pub fn sync_usage(state: State<'_, Mutex<AppState>>) -> Result<SyncStatus, String> {
-    let app = state.lock().map_err(|e| e.to_string())?;
-    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-
-    let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
-
+/// 读取 cc-switch 定价表（缺失或为空时返回空表，`pricing_found = false`）。
+fn load_pricing() -> (PricingTable, bool) {
     let ccp = cc_switch_db_path();
-    let (pricing, pricing_found) = if ccp.exists() {
+    if ccp.exists() {
         match PricingTable::load(&ccp) {
             Ok(t) if !t.is_empty() => (t, true),
             _ => (PricingTable::from_rows(vec![]), false),
         }
     } else {
         (PricingTable::from_rows(vec![]), false)
-    };
+    }
+}
+
+#[tauri::command]
+pub fn sync_usage(state: State<'_, Mutex<AppState>>) -> Result<SyncStatus, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+
+    let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
+    let (pricing, pricing_found) = load_pricing();
 
     let report = sync(&conn, &zcode_db_path(), &pricing, &overrides).map_err(|e| e.to_string())?;
     Ok(SyncStatus {
@@ -77,11 +81,39 @@ pub fn get_model_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64
     dao::query_model_stats(&conn, since, until).map_err(|e| e.to_string())
 }
 
+/// 保存「供应商 + 模型」的单价覆盖，立即重算该组合的所有行，返回重算行数。
 #[tauri::command]
-pub fn set_price_override(state: State<'_, Mutex<AppState>>, model_id: String, input: String, output: String, cache_read: String, cache_creation: String) -> Result<(), String> {
+pub fn set_price_override(
+    state: State<'_, Mutex<AppState>>,
+    provider_id: String, model_id: String,
+    input: String, output: String, cache_read: String, cache_creation: String,
+) -> Result<u32, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
     let p = crate::pricing::ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation)
-        .map_err(|e| e.to_string())?;
-    dao::set_override(&conn, &model_id, &p).map_err(|e| e.to_string())
+        .map_err(|e| format!("单价解析失败: {e}"))?;
+    crate::pricing::validate_non_negative(&p)?;
+    dao::set_override(&conn, &provider_id, &model_id, &p).map_err(|e| e.to_string())?;
+
+    // 保存后立即重算：重读覆盖与定价表再同步。
+    let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
+    let (pricing, _) = load_pricing();
+    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides).map_err(|e| e.to_string())?;
+    Ok(report.repriced as u32)
+}
+
+#[tauri::command]
+pub fn list_price_overrides(state: State<'_, Mutex<AppState>>) -> Result<Vec<dao::OverrideRow>, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::list_overrides(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_price_override(
+    state: State<'_, Mutex<AppState>>, provider_id: String, model_id: String,
+) -> Result<(), String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::delete_override(&conn, &provider_id, &model_id).map_err(|e| e.to_string())
 }

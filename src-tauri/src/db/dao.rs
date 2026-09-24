@@ -113,6 +113,7 @@ pub fn insert_record(conn: &Connection, r: &UsageRecord) -> Result<bool, AppErro
 /// 已导入但尚未定价（`priced = 0`）的记录，用于定价稍后可用时重定价。
 pub struct UnpricedRecord {
     pub request_id: String,
+    pub provider_id: String,
     pub model_id: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -122,18 +123,51 @@ pub struct UnpricedRecord {
 
 pub fn query_unpriced_records(conn: &Connection) -> Result<Vec<UnpricedRecord>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT request_id, model_id, input_tokens, output_tokens,
+        "SELECT request_id, provider_id, model_id, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens
          FROM usage_records WHERE priced = 0",
     )?;
     let it = stmt.query_map([], |row| {
         Ok(UnpricedRecord {
             request_id: row.get(0)?,
-            model_id: row.get(1)?,
-            input_tokens: row.get(2)?,
-            output_tokens: row.get(3)?,
-            cache_read_tokens: row.get(4)?,
-            cache_creation_tokens: row.get(5)?,
+            provider_id: row.get(1)?,
+            model_id: row.get(2)?,
+            input_tokens: row.get(3)?,
+            output_tokens: row.get(4)?,
+            cache_read_tokens: row.get(5)?,
+            cache_creation_tokens: row.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
+}
+
+/// 待重算成本的记录（覆盖重算用，不筛 `priced`）。
+#[derive(Debug)]
+pub struct RepriceRow {
+    pub request_id: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+/// 取某 `(provider_id, model_id)` 组合的**全部**行（含已定价），供覆盖重算使用。
+pub fn query_records_by_provider_model(
+    conn: &Connection, provider_id: &str, model_id: &str,
+) -> Result<Vec<RepriceRow>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT request_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+         FROM usage_records WHERE provider_id = ?1 AND model_id = ?2",
+    )?;
+    let it = stmt.query_map(params![provider_id, model_id], |row| {
+        Ok(RepriceRow {
+            request_id: row.get(0)?,
+            input_tokens: row.get(1)?,
+            output_tokens: row.get(2)?,
+            cache_read_tokens: row.get(3)?,
+            cache_creation_tokens: row.get(4)?,
         })
     })?;
     let mut out = Vec::new();
@@ -330,9 +364,20 @@ pub fn query_model_stats(conn: &Connection, since: i64, until: i64) -> Result<Ve
         .collect())
 }
 
-pub fn get_overrides(conn: &Connection) -> Result<HashMap<String, ModelPricing>, AppError> {
+/// 供 UI 展示的覆盖行（单价以字符串原样返回）。
+#[derive(Debug, Clone, Serialize)]
+pub struct OverrideRow {
+    pub provider_id: String,
+    pub model_id: String,
+    pub input: String,
+    pub output: String,
+    pub cache_read: String,
+    pub cache_creation: String,
+}
+
+pub fn get_overrides(conn: &Connection) -> Result<HashMap<(String, String), ModelPricing>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT model_id, input_cost_per_million, output_cost_per_million,
+        "SELECT provider_id, model_id, input_cost_per_million, output_cost_per_million,
                 cache_read_cost_per_million, cache_creation_cost_per_million
          FROM pricing_overrides",
     )?;
@@ -343,33 +388,63 @@ pub fn get_overrides(conn: &Connection) -> Result<HashMap<String, ModelPricing>,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
         ))
     })?;
     let mut map = HashMap::new();
     for r in it {
-        let (id, i, o, cr, cc) = r?;
+        let (pid, mid, i, o, cr, cc) = r?;
         if let Ok(p) = ModelPricing::from_strings(&i, &o, &cr, &cc) {
-            map.insert(id, p);
+            map.insert((pid, mid), p);
         }
     }
     Ok(map)
 }
 
-pub fn set_override(conn: &Connection, model_id: &str, p: &ModelPricing) -> Result<(), AppError> {
+pub fn list_overrides(conn: &Connection) -> Result<Vec<OverrideRow>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_id, model_id, input_cost_per_million, output_cost_per_million,
+                cache_read_cost_per_million, cache_creation_cost_per_million
+         FROM pricing_overrides ORDER BY provider_id, model_id",
+    )?;
+    let it = stmt.query_map([], |row| {
+        Ok(OverrideRow {
+            provider_id: row.get(0)?,
+            model_id: row.get(1)?,
+            input: row.get(2)?,
+            output: row.get(3)?,
+            cache_read: row.get(4)?,
+            cache_creation: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
+}
+
+pub fn set_override(conn: &Connection, provider_id: &str, model_id: &str, p: &ModelPricing) -> Result<(), AppError> {
     conn.execute(
-        "INSERT INTO pricing_overrides (model_id, input_cost_per_million, output_cost_per_million,
+        "INSERT INTO pricing_overrides (provider_id, model_id, input_cost_per_million, output_cost_per_million,
             cache_read_cost_per_million, cache_creation_cost_per_million)
-         VALUES (?1,?2,?3,?4,?5)
-         ON CONFLICT(model_id) DO UPDATE SET
+         VALUES (?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(provider_id, model_id) DO UPDATE SET
            input_cost_per_million = excluded.input_cost_per_million,
            output_cost_per_million = excluded.output_cost_per_million,
            cache_read_cost_per_million = excluded.cache_read_cost_per_million,
            cache_creation_cost_per_million = excluded.cache_creation_cost_per_million",
         params![
-            model_id,
+            provider_id, model_id,
             p.input.to_string(), p.output.to_string(),
             p.cache_read.to_string(), p.cache_creation.to_string()
         ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_override(conn: &Connection, provider_id: &str, model_id: &str) -> Result<(), AppError> {
+    conn.execute(
+        "DELETE FROM pricing_overrides WHERE provider_id = ?1 AND model_id = ?2",
+        params![provider_id, model_id],
     )?;
     Ok(())
 }
@@ -474,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn override_roundtrip() {
+    fn override_roundtrip_keyed_by_provider_and_model() {
         let c = conn();
         let p = ModelPricing {
             input: Decimal::from_str("0.3").unwrap(),
@@ -482,8 +557,72 @@ mod tests {
             cache_read: Decimal::from_str("0.006").unwrap(),
             cache_creation: Decimal::ZERO,
         };
-        set_override(&c, "m1", &p).unwrap();
+        set_override(&c, "p1", "m1", &p).unwrap();
+        // 同一模型不同供应商是两条独立记录
+        let p2 = ModelPricing { input: Decimal::from_str("9").unwrap(), ..p.clone() };
+        set_override(&c, "p2", "m1", &p2).unwrap();
+
         let map = get_overrides(&c).unwrap();
-        assert_eq!(map.get("m1").unwrap().input, p.input);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&("p1".into(), "m1".into())).unwrap().input, p.input);
+        assert_eq!(map.get(&("p2".into(), "m1".into())).unwrap().input, p2.input);
+
+        // UPSERT：同键再写覆盖单价
+        let p3 = ModelPricing { input: Decimal::from_str("0.5").unwrap(), ..p.clone() };
+        set_override(&c, "p1", "m1", &p3).unwrap();
+        let map = get_overrides(&c).unwrap();
+        assert_eq!(map.len(), 2, "UPSERT 不应新增行");
+        assert_eq!(map.get(&("p1".into(), "m1".into())).unwrap().input, p3.input);
+    }
+
+    #[test]
+    fn list_and_delete_override() {
+        let c = conn();
+        let p = ModelPricing {
+            input: Decimal::from_str("0.3").unwrap(),
+            output: Decimal::from_str("1.2").unwrap(),
+            cache_read: Decimal::from_str("0.006").unwrap(),
+            cache_creation: Decimal::ZERO,
+        };
+        set_override(&c, "p2", "m2", &p).unwrap();
+        set_override(&c, "p1", "m1", &p).unwrap();
+
+        let rows = list_overrides(&c).unwrap();
+        assert_eq!(rows.len(), 2);
+        // 按 (provider_id, model_id) 排序
+        assert_eq!((rows[0].provider_id.as_str(), rows[0].model_id.as_str()), ("p1", "m1"));
+        assert_eq!(rows[0].input, "0.3");
+        assert_eq!(rows[0].cache_read, "0.006");
+
+        delete_override(&c, "p1", "m1").unwrap();
+        let rows = list_overrides(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_id, "p2");
+        // 删除不存在的键不报错
+        delete_override(&c, "nope", "nope").unwrap();
+    }
+
+    #[test]
+    fn query_records_by_provider_model_returns_all_rows_of_combo() {
+        let c = conn();
+        let mut a = rec("a", "m1", 10);
+        a.provider_id = "p1".into();
+        a.priced = true;
+        let mut b = rec("b", "m1", 20);
+        b.provider_id = "p1".into();
+        b.priced = false; // 未定价行也必须返回
+        let mut other = rec("c", "m1", 30);
+        other.provider_id = "p2".into();
+        insert_record(&c, &a).unwrap();
+        insert_record(&c, &b).unwrap();
+        insert_record(&c, &other).unwrap();
+
+        let rows = query_records_by_provider_model(&c, "p1", "m1").unwrap();
+        let mut ids: Vec<&str> = rows.iter().map(|r| r.request_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"], "只取目标组合的所有行（含 priced=0）");
+
+        let empty = query_records_by_provider_model(&c, "p1", "nope").unwrap();
+        assert!(empty.is_empty());
     }
 }

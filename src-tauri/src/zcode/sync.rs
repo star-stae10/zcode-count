@@ -44,7 +44,7 @@ pub fn sync(
     conn: &Connection,
     zcode_path: &Path,
     pricing: &PricingTable,
-    overrides: &HashMap<String, ModelPricing>,
+    overrides: &HashMap<(String, String), ModelPricing>,
 ) -> Result<SyncReport, AppError> {
     if !zcode_path.exists() {
         return Ok(SyncReport { zcode_found: false, ..Default::default() });
@@ -78,7 +78,7 @@ pub fn sync(
             if r.started_at > max_started {
                 max_started = r.started_at;
             }
-            let cost = resolve(&r.model_id, pricing, overrides)
+            let cost = resolve(&r.provider_id, &r.model_id, pricing, overrides)
                 .map(|p| calculate_cache_inclusive(r.input_tokens, r.output_tokens, r.cache_read, r.cache_creation, &p));
             let priced = cost.is_some();
             if !priced {
@@ -126,10 +126,28 @@ pub fn sync(
         report.last_started_at = max_started;
     }
 
-    // 重定价 pass：修复已导入但当时无定价的行（priced=0）。定价来源稍后可用时补算成本。
+    // 重定价 pass（不受 mtime 短路影响：定价来源独立于 ZCode 文件）。
+    // (a) 覆盖重算：对每个覆盖的 (provider, model)，重算该组合的**所有**行（含已定价）。
+    if !overrides.is_empty() {
+        for ((provider_id, model_id), p) in overrides {
+            for r in dao::query_records_by_provider_model(conn, provider_id, model_id)? {
+                let c = calculate_cache_inclusive(
+                    r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens, p);
+                dao::update_record_pricing(
+                    conn, &r.request_id,
+                    &c.input_cost.to_string(), &c.output_cost.to_string(),
+                    &c.cache_read_cost.to_string(), &c.cache_creation_cost.to_string(),
+                    &c.total_cost.to_string(),
+                )?;
+                report.repriced += 1;
+            }
+        }
+    }
+
+    // (b) 表回填：修复已导入但当时无定价的行（priced=0）。
     if !pricing.is_empty() {
         for r in dao::query_unpriced_records(conn)? {
-            if let Some(p) = resolve(&r.model_id, pricing, overrides) {
+            if let Some(p) = resolve(&r.provider_id, &r.model_id, pricing, overrides) {
                 let c = calculate_cache_inclusive(
                     r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens, &p);
                 dao::update_record_pricing(
@@ -404,6 +422,81 @@ mod tests {
         assert_eq!(r.total_cost_usd, "0.0003");
 
         let _ = std::fs::remove_file(&zpath);
+    }
+
+    /// 覆盖优先：给 `(p1, m1)` 设覆盖后，该组合**所有**行（含原已按表定价的）被重算为覆盖价，
+    /// 其它组合不变；且覆盖单独存在（不依赖 pricing 表）时也触发重算。
+    #[test]
+    fn override_reprices_all_rows_of_combo_and_leaves_others() {
+        let dir = std::env::temp_dir().join(format!("zc-test-ovr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        {
+            let c = rusqlite::Connection::open(&zpath).unwrap();
+            c.execute_batch(
+                "INSERT INTO model_usage VALUES
+                 ('r1','p1','m1','completed',100,0,0,1000,0,0,0,0,'s1','main_turn'),
+                 ('r2','p1','m1','completed',200,0,0,2000,0,0,0,0,'s1','main_turn'),
+                 ('r3','p1','m2','completed',300,0,0,1000,0,0,0,0,'s1','main_turn');",
+            ).unwrap();
+        }
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let table = PricingTable::from_rows(vec![
+            ("m1".into(), ModelPricing { input: Decimal::from_str("0.3").unwrap(), ..pricing_zero() }),
+            ("m2".into(), ModelPricing { input: Decimal::from_str("0.3").unwrap(), ..pricing_zero() }),
+        ]);
+
+        // 第一次：无覆盖 → 全部按表定价
+        let first = sync(&conn, &zpath, &table, &HashMap::new()).unwrap();
+        assert_eq!(first.imported, 3);
+        let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        let cost = |id: &str| Decimal::from_str(
+            &logs.iter().find(|l| l.request_id == id).unwrap().total_cost_usd).unwrap();
+        assert_eq!(cost("r1"), Decimal::from_str("0.0003").unwrap());
+        assert_eq!(cost("r2"), Decimal::from_str("0.0006").unwrap());
+        assert_eq!(cost("r3"), Decimal::from_str("0.0003").unwrap());
+
+        // 第二次：设覆盖 (p1, m1) 输入价 1.0；ZCode 文件未变（mtime 短路），覆盖重算仍须执行。
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            ("p1".to_string(), "m1".to_string()),
+            ModelPricing { input: Decimal::from_str("1.0").unwrap(), ..pricing_zero() },
+        );
+        let second = sync(&conn, &zpath, &table, &overrides).unwrap();
+        assert_eq!(second.repriced, 2, "该组合 2 行（含已定价行）都应重算");
+
+        let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        let cost = |id: &str| Decimal::from_str(
+            &logs.iter().find(|l| l.request_id == id).unwrap().total_cost_usd).unwrap();
+        assert_eq!(cost("r1"), Decimal::from_str("0.001").unwrap(), "r1 用覆盖价 1.0");
+        assert_eq!(cost("r2"), Decimal::from_str("0.002").unwrap(), "r2 用覆盖价 1.0");
+        assert_eq!(cost("r3"), Decimal::from_str("0.0003").unwrap(), "其它组合不受影响");
+
+        // 覆盖单独存在（pricing 表为空）也应触发重算。
+        let mut overrides2 = HashMap::new();
+        overrides2.insert(
+            ("p1".to_string(), "m1".to_string()),
+            ModelPricing { input: Decimal::from_str("2.0").unwrap(), ..pricing_zero() },
+        );
+        let third = sync(&conn, &zpath, &PricingTable::from_rows(vec![]), &overrides2).unwrap();
+        assert_eq!(third.repriced, 2, "空定价表 + 有覆盖也必须重算");
+        let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        let cost = |id: &str| Decimal::from_str(
+            &logs.iter().find(|l| l.request_id == id).unwrap().total_cost_usd).unwrap();
+        assert_eq!(cost("r1"), Decimal::from_str("0.002").unwrap());
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    fn pricing_zero() -> ModelPricing {
+        ModelPricing {
+            input: Decimal::ZERO, output: Decimal::ZERO,
+            cache_read: Decimal::ZERO, cache_creation: Decimal::ZERO,
+        }
     }
 
     /// 文件未变化（含 -wal）→ 第二次 sync 短路：不重扫、不写游标。

@@ -32,15 +32,16 @@ React UI  src/  （汇总卡 + 三页签：请求日志 / Provider 统计 / 模�
 
 ```
 src-tauri/src/
-├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 6 个命令）
-├─ commands.rs       # AppState、SyncStatus、6 个 Tauri 命令
+├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 8 个命令）
+├─ commands.rs       # AppState、SyncStatus、8 个 Tauri 命令
 ├─ error.rs          # AppError（thiserror；实现 Serialize 供命令返回）
 ├─ db/
 │  ├─ mod.rs         # OwnDb { pub conn: Mutex<Connection> }、default_db_path()
 │  ├─ schema.rs      # migrate()：建 usage_records / sync_cursors / pricing_overrides + 幂等补列
 │  └─ dao.rs         # 结构体 + 查询：insert_record/get_cursor/set_cursor/query_summary/
 │                    #   query_logs/query_provider_stats/query_model_stats/get_overrides/
-│                    #   set_override/query_unpriced_records/update_record_pricing
+│                    #   set_override/delete_override/list_overrides/query_unpriced_records/
+│                    #   query_records_by_provider_model/update_record_pricing
 ├─ pricing/
 │  ├─ mod.rs         # ModelPricing、cc_switch_db_path()、resolve()
 │  ├─ candidates.rs  # model_candidates()：模型名归一化
@@ -53,7 +54,7 @@ src-tauri/src/
 src/
 ├─ lib/api.ts        # invoke 封装 + 全部前端类型（字段 snake_case，与 Rust Serialize 对齐）
 ├─ lib/format.ts     # formatTokens/formatCost/formatCostWithUnpriced/formatTime/rangeToWindow/rangeLabel
-├─ components/       # Toolbar / SummaryCards / Tabs / RequestLogTable / ProviderStatsTable / ModelStatsTable
+├─ components/       # Toolbar / SummaryCards / Tabs / RequestLogTable / ProviderStatsTable / ModelStatsTable / PricingOverrideDialog
 └─ App.tsx           # range/tab/status/summary/logs/stats/error/loading state + refresh()
 
 .github/workflows/build.yml   # Windows CI 构建
@@ -95,7 +96,9 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 4. **幂等**：`request_id` = ZCode `model_usage.id`（主键），`INSERT OR IGNORE`。
 
-5. **自动重定价**：sync 末尾对 `usage_records` 中 `priced = 0` 的行重新查价，命中则更新成本并置 `priced = 1`。这样 cc-switch 补价后历史行会自动回填。
+5. **自动重定价**（sync 末尾两段，均不受 mtime 短路影响）：
+   - (a) **覆盖重算**：对每个 `pricing_overrides` 的 `(provider, model)`，重算该组合的**所有**行（含已定价），计入 `repriced`。
+   - (b) **表回填**：对 `usage_records` 中 `priced = 0` 的行重新查价（`resolve`），命中则更新并置 `priced = 1`。cc-switch 补价后历史行自动回填。
 
 6. **定价来源 = cc-switch 的 `model_pricing` 表（必需依赖）**：
    - 模型名归一化（`pricing/candidates.rs`）：取最后一个 `/` 之后、`:` 之前、转小写、去尾部纯数字后缀。
@@ -118,7 +121,7 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 **自有库 `usage_records`**：`request_id(PK), app_type, provider_id, model_id, query_source, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd, priced, started_at, duration_ms, first_token_ms, status, session_id, created_at`
 
 **`sync_cursors`**：`source(PK, ZCode库路径), last_started_at, last_mtime, last_synced_at`
-**`pricing_overrides`**：`model_id(PK) + 四个单价`（目前无 UI 调用方）
+**`pricing_overrides`**：`(provider_id, model_id)(PK) + 四个单价`（UI：工具栏「定价覆盖」弹窗）
 
 ## 6. 扩展新功能的套路
 
@@ -156,10 +159,9 @@ CI：`.github/workflows/build.yml`，`windows-latest`，跑 `cargo test` + `pnpm
 - **前端 `refresh()` 竞态**：快速切换时间范围时无请求序号，旧响应可能覆盖新状态；且 `refresh` 串行 5 个 IPC await，`sync` 失败会阻断数据刷新。
 - **切换时间范围会触发一次 sync**（mtime 短路使开销很小，但语义耦合）。
 - **死字段**：`SyncStatus.last_error` 恒为 None；`usage_records.created_at` 实际存的是 `started_at`。
-- **重定价触发条件过窄**：仅当 `pricing` 表非空才执行（`pricing_overrides` 单独存在时不触发）。
 - **模板残留**：`index.html` 标题/favicon 仍是脚手架值；`Cargo.toml` 的 `description`/`authors` 是默认值；`@tauri-apps/plugin-opener` 依赖未使用。
 - **迁移无 `PRAGMA user_version`**：靠 ad-hoc 列检查。
-- **`formatCost` 对极小金额显示 `$0.0000`**。
+- **`formatCost` 对极小金额显示 `$0.00000`**（5 位小数）。
 - **CI**：actions 有 Node 20 deprecation 警告（不影响构建）；可考虑升级 action 版本。
 
 ## 9. 历史留档
