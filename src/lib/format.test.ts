@@ -10,16 +10,16 @@ describe("formatTokens", () => {
 });
 
 describe("formatCost", () => {
-  it("shows 4 decimals and dash when unpriced", () => {
-    expect(formatCost("0.0006648", true)).toBe("$0.0007");
+  it("shows 5 decimals and dash when unpriced", () => {
+    expect(formatCost("0.0006648", true)).toBe("$0.00066");
     expect(formatCost("0", false)).toBe("—");
   });
 });
 
 describe("formatCostWithUnpriced", () => {
   it("plain $ when nothing unpriced", () => {
-    expect(formatCostWithUnpriced("0.01", 0, 2)).toBe("$0.0100");
-    expect(formatCostWithUnpriced("0", 0, 0)).toBe("$0.0000");
+    expect(formatCostWithUnpriced("0.01", 0, 2)).toBe("$0.01000");
+    expect(formatCostWithUnpriced("0", 0, 0)).toBe("$0.00000");
   });
 
   it("— when every request is unpriced", () => {
@@ -28,7 +28,7 @@ describe("formatCostWithUnpriced", () => {
   });
 
   it("≥ $ when only part is unpriced", () => {
-    expect(formatCostWithUnpriced("0.01", 1, 2)).toBe("≥ $0.0100");
+    expect(formatCostWithUnpriced("0.01", 1, 2)).toBe("≥ $0.01000");
   });
 });
 

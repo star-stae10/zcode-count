@@ -33,7 +33,7 @@ describe("ModelStatsTable", () => {
     expect(html).toContain("2");
     expect(html).toContain("1.2K");
     expect(html).toContain("340");
-    expect(html).toContain("$0.0100");
+    expect(html).toContain("$0.01000");
   });
 
   it("renders the all-models summary row with aggregated values", () => {
@@ -41,7 +41,7 @@ describe("ModelStatsTable", () => {
     expect(html).toContain("所有模型");
     expect(html).toContain("5.0K");
     expect(html).toContain("900");
-    expect(html).toContain("$0.1234");
+    expect(html).toContain("$0.12340");
     expect(html).toContain("7");
   });
 
@@ -50,8 +50,8 @@ describe("ModelStatsTable", () => {
       <ModelStatsTable rows={[row({ unpriced_count: 2 })]} summary={summary} />,
     );
     expect(html).toContain("—");
-    expect(html).not.toContain("$0.0100");
-    expect(html).toContain("$0.1234");
+    expect(html).not.toContain("$0.01000");
+    expect(html).toContain("$0.12340");
   });
 
   it("shows — for the summary row when all requests are unpriced", () => {
@@ -59,8 +59,8 @@ describe("ModelStatsTable", () => {
       <ModelStatsTable rows={[row()]} summary={{ ...summary, unpriced_count: 7 }} />,
     );
     expect(html).toContain("—");
-    expect(html).not.toContain("$0.1234");
-    expect(html).toContain("$0.0100");
+    expect(html).not.toContain("$0.12340");
+    expect(html).toContain("$0.01000");
   });
 
   it("omits the summary row when summary is null", () => {

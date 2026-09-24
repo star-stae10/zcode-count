@@ -33,7 +33,7 @@ describe("RequestLogTable", () => {
     expect(html).toContain("120");
     expect(html).toContain("R34");
     expect(html).toContain("56");
-    expect(html).toContain("$0.0100");
+    expect(html).toContain("$0.01000");
     expect(html).toContain("1.5s / 0.3s");
     expect(html).toContain("main_turn");
     expect(html).toMatch(/\d\d\/\d\d \d\d:\d\d/);

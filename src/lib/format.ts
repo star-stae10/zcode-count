@@ -10,7 +10,7 @@ export function formatCost(usd: string, priced: boolean): string {
   if (!priced) return "—";
   const v = Number(usd);
   if (!Number.isFinite(v)) return "—";
-  return `$${v.toFixed(4)}`;
+  return `$${v.toFixed(5)}`;
 }
 
 /**

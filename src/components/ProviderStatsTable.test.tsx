@@ -25,7 +25,7 @@ describe("ProviderStatsTable", () => {
     expect(html).toContain("3");
     expect(html).toContain("1.2K");
     expect(html).toContain("340");
-    expect(html).toContain("$0.0100");
+    expect(html).toContain("$0.01000");
   });
 
   it("renders multiple providers in given order", () => {
@@ -40,13 +40,13 @@ describe("ProviderStatsTable", () => {
       <ProviderStatsTable rows={[row({ unpriced_count: 3 })]} />,
     );
     expect(html).toContain("—");
-    expect(html).not.toContain("$0.0100");
+    expect(html).not.toContain("$0.01000");
   });
 
   it("shows ≥ cost when only some requests are priced", () => {
     const html = renderToStaticMarkup(
       <ProviderStatsTable rows={[row({ unpriced_count: 2 })]} />,
     );
-    expect(html).toContain("≥ $0.0100");
+    expect(html).toContain("≥ $0.01000");
   });
 });
