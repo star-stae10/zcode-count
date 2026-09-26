@@ -161,7 +161,8 @@ CI：`.github/workflows/build.yml`，`windows-latest`，跑 `cargo test` + `pnpm
 - **前端 `refresh()` 竞态**：快速切换时间范围时无请求序号，旧响应可能覆盖新状态；且 `refresh` 串行 5 个 IPC await，`sync` 失败会阻断数据刷新。
 - **切换时间范围会触发一次 sync**（mtime 短路使开销很小，但语义耦合）。
 - **死字段**：`SyncStatus.last_error` 恒为 None；`usage_records.created_at` 实际存的是 `started_at`。
-- **模板残留**：`index.html` 标题/favicon 仍是脚手架值；`Cargo.toml` 的 `description`/`authors` 是默认值；`@tauri-apps/plugin-opener` 依赖未使用。
+- **模板残留**：`Cargo.toml` 的 `description`/`authors` 是默认值；`@tauri-apps/plugin-opener` 依赖未使用。（index.html 标题/favicon 已随图标更换修复。）
+- **应用图标**：源图为 `src-tauri/icons/source.png`（1024×1024 RGBA，黑底方形设计，**不要抠透明**——发光效果依赖黑底）。重新生成全套图标用 `pnpm tauri icon src-tauri/icons/source.png`，生成后会附带 android/ios 目录，桌面项目用不到可删除。
 - **迁移无 `PRAGMA user_version`**：靠 ad-hoc 列检查。
 - **`formatCost` 对极小金额显示 `$0.00000`**（5 位小数）。
 - **CI**：actions 有 Node 20 deprecation 警告（不影响构建）；可考虑升级 action 版本。
