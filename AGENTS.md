@@ -112,6 +112,8 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 9. **`query_source`**（ZCode 的 `main_turn`/`subagent`/`session_title`/`compact` 等）全链路贯通到请求日志的「来源」列。
 
+10. **供应商筛选全局生效**：工具栏供应商下拉传给 summary / 请求日志 / Provider 统计 / 模型统计四类查询（SQL 用 `AND (?N IS NULL OR provider_id = ?N)` 过滤）。模型统计页「所有模型」合计行取自筛选后的 summary，与明细一致。注意：工具栏下拉与定价覆盖弹窗的供应商**选项**始终来自未筛选的全量统计（`App.tsx` 的 `providerOptions` state），否则筛选后下拉只剩被选供应商、无法切换。
+
 ## 5. 数据源 schema 速查
 
 **ZCode `model_usage`**（只读）：`id, provider_id, model_id, query_source, status, started_at(ms), completed_at, duration_ms, time_to_first_token_ms, input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, provider_total_tokens, computed_total_tokens, session_id, ...`
