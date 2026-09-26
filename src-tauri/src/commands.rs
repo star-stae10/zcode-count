@@ -54,10 +54,10 @@ pub fn sync_usage(state: State<'_, Mutex<AppState>>) -> Result<SyncStatus, Strin
 }
 
 #[tauri::command]
-pub fn get_summary(state: State<'_, Mutex<AppState>>, since: i64, until: i64) -> Result<dao::Summary, String> {
+pub fn get_summary(state: State<'_, Mutex<AppState>>, since: i64, until: i64, provider: Option<String>) -> Result<dao::Summary, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_summary(&conn, since, until).map_err(|e| e.to_string())
+    dao::query_summary(&conn, since, until, provider.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -68,17 +68,17 @@ pub fn list_logs(state: State<'_, Mutex<AppState>>, since: i64, until: i64, prov
 }
 
 #[tauri::command]
-pub fn get_provider_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64) -> Result<Vec<dao::ProviderStat>, String> {
+pub fn get_provider_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64, provider: Option<String>) -> Result<Vec<dao::ProviderStat>, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_provider_stats(&conn, since, until).map_err(|e| e.to_string())
+    dao::query_provider_stats(&conn, since, until, provider.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_model_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64) -> Result<Vec<dao::ModelStat>, String> {
+pub fn get_model_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64, provider: Option<String>) -> Result<Vec<dao::ModelStat>, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_model_stats(&conn, since, until).map_err(|e| e.to_string())
+    dao::query_model_stats(&conn, since, until, provider.as_deref()).map_err(|e| e.to_string())
 }
 
 /// 保存「供应商 + 模型」的单价覆盖，立即重算该组合的所有行，返回重算行数。

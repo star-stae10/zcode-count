@@ -35,11 +35,14 @@ export interface PriceOverride {
 }
 
 export const syncUsage = () => invoke<SyncStatus>("sync_usage");
-export const getSummary = (since: number, until: number) => invoke<Summary>("get_summary", { since, until });
+export const getSummary = (since: number, until: number, provider: string | null) =>
+  invoke<Summary>("get_summary", { since, until, provider });
 export const listLogs = (since: number, until: number, provider: string | null, limit: number) =>
   invoke<RequestLogRow[]>("list_logs", { since, until, provider, limit });
-export const getProviderStats = (since: number, until: number) => invoke<ProviderStat[]>("get_provider_stats", { since, until });
-export const getModelStats = (since: number, until: number) => invoke<ModelStat[]>("get_model_stats", { since, until });
+export const getProviderStats = (since: number, until: number, provider: string | null) =>
+  invoke<ProviderStat[]>("get_provider_stats", { since, until, provider });
+export const getModelStats = (since: number, until: number, provider: string | null) =>
+  invoke<ModelStat[]>("get_model_stats", { since, until, provider });
 
 // 注意：Tauri v2 参数默认 camelCase 映射到 Rust 的 snake_case。
 export const setPriceOverride = (providerId: string, modelId: string, input: string, output: string, cacheRead: string, cacheCreation: string) =>

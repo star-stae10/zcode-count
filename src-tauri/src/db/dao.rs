@@ -215,13 +215,14 @@ pub fn set_cursor(conn: &Connection, source: &str, last_started_at: i64, last_mt
     Ok(())
 }
 
-pub fn query_summary(conn: &Connection, since: i64, until: i64) -> Result<Summary, AppError> {
+pub fn query_summary(conn: &Connection, since: i64, until: i64, provider: Option<&str>) -> Result<Summary, AppError> {
     let mut stmt = conn.prepare(
         "SELECT input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
                 cache_creation_tokens, session_id, total_cost_usd, priced
-         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2",
+         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2
+           AND (?3 IS NULL OR provider_id = ?3)",
     )?;
-    let it = stmt.query_map(params![since, until], |row| {
+    let it = stmt.query_map(params![since, until, provider], |row| {
         Ok((
             row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
@@ -295,13 +296,14 @@ pub fn query_logs(conn: &Connection, since: i64, until: i64, provider: Option<&s
     Ok(rows)
 }
 
-fn group_stats(conn: &Connection, key: &str, since: i64, until: i64) -> Result<Vec<(String, i64, i64, i64, String, i64)>, AppError> {
+fn group_stats(conn: &Connection, key: &str, since: i64, until: i64, provider: Option<&str>) -> Result<Vec<(String, i64, i64, i64, String, i64)>, AppError> {
     let sql = format!(
         "SELECT {key}, input_tokens, output_tokens, total_cost_usd, priced
-         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2"
+         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2
+           AND (?3 IS NULL OR provider_id = ?3)"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let it = stmt.query_map(params![since, until], |row| {
+    let it = stmt.query_map(params![since, until, provider], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -336,8 +338,8 @@ fn group_stats(conn: &Connection, key: &str, since: i64, until: i64) -> Result<V
     Ok(out)
 }
 
-pub fn query_provider_stats(conn: &Connection, since: i64, until: i64) -> Result<Vec<ProviderStat>, AppError> {
-    Ok(group_stats(conn, "provider_id", since, until)?
+pub fn query_provider_stats(conn: &Connection, since: i64, until: i64, provider: Option<&str>) -> Result<Vec<ProviderStat>, AppError> {
+    Ok(group_stats(conn, "provider_id", since, until, provider)?
         .into_iter()
         .map(|(id, c, i, o, cost, unpriced)| ProviderStat {
             provider_id: id,
@@ -350,8 +352,8 @@ pub fn query_provider_stats(conn: &Connection, since: i64, until: i64) -> Result
         .collect())
 }
 
-pub fn query_model_stats(conn: &Connection, since: i64, until: i64) -> Result<Vec<ModelStat>, AppError> {
-    Ok(group_stats(conn, "model_id", since, until)?
+pub fn query_model_stats(conn: &Connection, since: i64, until: i64, provider: Option<&str>) -> Result<Vec<ModelStat>, AppError> {
+    Ok(group_stats(conn, "model_id", since, until, provider)?
         .into_iter()
         .map(|(id, c, i, o, cost, unpriced)| ModelStat {
             model_id: id,
@@ -518,7 +520,7 @@ mod tests {
         let c = conn();
         insert_record(&c, &rec("a", "m1", 10)).unwrap();
         insert_record(&c, &rec("b", "m1", 20)).unwrap();
-        let s = query_summary(&c, 0, 100).unwrap();
+        let s = query_summary(&c, 0, 100, None).unwrap();
         assert_eq!(s.request_count, 2);
         assert_eq!(s.input_tokens, 2000);
         assert_eq!(s.output_tokens, 1000);
@@ -532,7 +534,7 @@ mod tests {
         let c = conn();
         insert_record(&c, &rec("a", "m1", 10)).unwrap();
         insert_record(&c, &rec("b", "m2", 20)).unwrap();
-        let rows = query_model_stats(&c, 0, 100).unwrap();
+        let rows = query_model_stats(&c, 0, 100, None).unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -544,15 +546,41 @@ mod tests {
         unpriced.priced = false;
         insert_record(&c, &unpriced).unwrap();
 
-        let models = query_model_stats(&c, 0, 100).unwrap();
+        let models = query_model_stats(&c, 0, 100, None).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].request_count, 2);
         assert_eq!(models[0].unpriced_count, 1);
 
-        let providers = query_provider_stats(&c, 0, 100).unwrap();
+        let providers = query_provider_stats(&c, 0, 100, None).unwrap();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].request_count, 2);
         assert_eq!(providers[0].unpriced_count, 1);
+    }
+
+    #[test]
+    fn summary_and_stats_filter_by_provider() {
+        let c = conn();
+        let mut b = rec("b", "m2", 20);
+        b.provider_id = "p2".into();
+        insert_record(&c, &rec("a", "m1", 10)).unwrap();
+        insert_record(&c, &b).unwrap();
+
+        // summary：筛选只含 p2 的行，None 为全量
+        let s = query_summary(&c, 0, 100, Some("p2")).unwrap();
+        assert_eq!(s.request_count, 1);
+        assert_eq!(s.input_tokens, 1000);
+        assert_eq!(query_summary(&c, 0, 100, None).unwrap().request_count, 2);
+        assert_eq!(query_summary(&c, 0, 100, Some("nope")).unwrap().request_count, 0);
+
+        let providers = query_provider_stats(&c, 0, 100, Some("p2")).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].provider_id, "p2");
+        assert!(query_provider_stats(&c, 0, 100, Some("nope")).unwrap().is_empty());
+
+        let models = query_model_stats(&c, 0, 100, Some("p2")).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_id, "m2");
+        assert!(query_model_stats(&c, 0, 100, Some("nope")).unwrap().is_empty());
     }
 
     #[test]

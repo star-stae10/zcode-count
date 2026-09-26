@@ -25,6 +25,7 @@ export default function App() {
   const [tab, setTab] = useState<TabId>("logs");
   const [logs, setLogs] = useState<RequestLogRow[]>([]);
   const [providerStats, setProviderStats] = useState<ProviderStat[]>([]);
+  const [providerOptions, setProviderOptions] = useState<string[]>([]);
   const [modelStats, setModelStats] = useState<ModelStat[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,10 +37,16 @@ export default function App() {
       const st = await syncUsage();
       setStatus(st);
       const { since, until } = rangeToWindow(range, customSince, customUntil);
-      setSummary(await getSummary(since, until));
+      setSummary(await getSummary(since, until, provider));
       setLogs(await listLogs(since, until, provider, 500));
-      setProviderStats(await getProviderStats(since, until));
-      setModelStats(await getModelStats(since, until));
+      const providerRows = await getProviderStats(since, until, provider);
+      setProviderStats(providerRows);
+      setModelStats(await getModelStats(since, until, provider));
+      // 供应商下拉与定价弹窗的选项始终取未筛选的全量列表，筛选后仍可切换供应商
+      const allProviderStats = provider === null
+        ? providerRows
+        : await getProviderStats(since, until, null);
+      setProviderOptions(allProviderStats.map((p) => p.provider_id));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -56,14 +63,14 @@ export default function App() {
         range={range} onRange={setRange}
         status={status} onRefresh={refresh} loading={loading}
         provider={provider} onProvider={setProvider}
-        providers={providerStats.map((p) => p.provider_id)}
+        providers={providerOptions}
         customSince={customSince} customUntil={customUntil}
         onCustomSince={setCustomSince} onCustomUntil={setCustomUntil}
         onOpenPricing={() => setPricingOpen(true)}
       />
       {pricingOpen && (
         <PricingOverrideDialog
-          providers={providerStats.map((p) => p.provider_id)}
+          providers={providerOptions}
           onClose={() => setPricingOpen(false)}
           onChanged={() => void refresh()}
         />
