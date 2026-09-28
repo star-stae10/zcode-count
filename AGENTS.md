@@ -168,16 +168,33 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 **测试风格**：Rust 用文件内 `#[cfg(test)]`（内存 SQLite / 临时文件）；前端用 vitest + `renderToStaticMarkup`（无 jsdom）。测试要**真断言行为**，别只断言「不 panic」。
 
-## 7. 发布流程
+## 7. 发布流程（v1.0.0 起：tag → CI 自动出 GitHub Release）
+
+**机制**：`.github/workflows/build.yml` 在 `windows-latest` 上跑 `cargo test` + `pnpm test` + `pnpm tauri build`；构建成功后由 `softprops/action-gh-release@v2` 步骤（仅当触发 ref 为 `v*` tag 时执行，手动 workflow_dispatch 不发）**自动创建 GitHub Release 并上传安装包资产**（NSIS `*-setup.exe` + MSI `.msi`），public 仓库资产匿名可下载。Release 产生的是「资产」，与仅供登录用户下载的 Actions artifact 是两回事—— Releases 页可点击下载的就是资产。
+
+**发版步骤（AI 可全程代执行）**：
 
 ```bash
-git add -A && git commit -m "..."
+# 1. 版本号三处同步（缺一不可）：package.json、src-tauri/Cargo.toml、src-tauri/tauri.conf.json
+#    （改 Cargo.toml 后跑一次 cargo check 让 Cargo.lock 随动）
+# 2. 更新 CHANGELOG.md：新增「## [X.Y.Z] - 日期」段（新增/修复/其他 + 下载说明，参照 v1.0.0 段格式）
+# 3. 提交并打 tag：
+git add -A && git commit -m "chore(release): vX.Y.Z"
 git push origin master
-git tag vX.Y.Z && git push origin vX.Y.Z     # 触发 CI
-gh run list / gh run watch                    # 查看构建
-gh run download <run-id> -D out               # 下载 artifact（含 .msi 与 setup.exe）
+git tag vX.Y.Z && git push origin vX.Y.Z        # 推 tag 即触发 CI 构建并自动发 Release
+# 4. 监视与验证：
+gh run watch <run-id>                            # 约 5-10 分钟，确认「Create GitHub Release and upload installers」步骤 ✓
+gh release view vX.Y.Z                           # 核对资产（.exe + .msi 各 1 个）
+gh api repos/star-stae10/zcode-count/releases/latest --jq .tag_name   # 确认 latest 指向新版本
 ```
-CI：`.github/workflows/build.yml`，`windows-latest`，跑 `cargo test` + `pnpm test` + `pnpm tauri build`，上传 artifact `zcode-count-windows`。
+
+**Release notes 维护**：CI 默认生成 commit 列表当说明；发版后用 CHANGELOG 对应段覆盖：
+`sed -n '/^## \[X.Y.Z\]/,/^## \[X.Y.W-1\]/p' CHANGELOG.md | sed '$d' > notes.md && gh release edit vX.Y.Z --title "vX.Y.Z" --notes-file notes.md`
+
+**注意事项**：
+- tag 必须打在包含最新版本号三处改动的 commit 上，否则二进制内版本与 tag 不一致（只影响显示，无自动更新机制，但仍应保持一致）。
+- 发版前四件套必须全绿（§3）。
+- 不打 tag 就不会有任何 Release 动作；发错版本可在 GitHub Release 页删除 Release 与 tag 重来（安装包资产会被 CI 重新上传）。
 
 ## 8. 已知限制 / 待办（可改进项）
 
