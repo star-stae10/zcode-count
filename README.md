@@ -38,16 +38,28 @@ pnpm tauri build
 - MSI：`src-tauri/target/release/bundle/msi/*.msi`
 - NSIS 安装程序：`src-tauri/target/release/bundle/nsis/*-setup.exe`
 
-## 从 GitHub Actions 下载
+## 下载安装包（推荐）
+
+**从 GitHub Releases 下载**（无需登录 GitHub 账号）：
+
+1. 打开仓库主页的 **Releases** 页（或直接访问 `https://github.com/star-stae10/zcode-count/releases/latest`）；
+2. 在 **Assets** 中下载安装包，**优先选 NSIS 版** `zcode-count_<版本>_x64-setup.exe`（安装到用户目录，无需管理员权限）；MSI 版（`*.msi`）需要管理员权限安装；
+3. 双击运行安装。首次安装如遇 Windows SmartScreen「已保护你的电脑」提示，属正常现象（应用未购买代码签名证书），点击「更多信息」→「仍要运行」即可。
+
+每次推送 `v*` tag（如 `v1.0.0`）时，CI 会自动构建并创建对应的 GitHub Release。
+
+> 更新方式：新版本发布后，下载新安装包直接覆盖安装即可（用户数据 `~/.zcode-count/zcode-count.db` 不受重装影响）。
+
+## 从 GitHub Actions 下载（备用）
 
 仓库包含 `build` 工作流（`.github/workflows/build.yml`），在以下情况触发：
 
 - 手动触发（`workflow_dispatch`）
-- 推送 `v*` 形式的 tag（如 `v0.1.0`）
+- 推送 `v*` 形式的 tag（如 `v1.0.0`）
 
-工作流在 `windows-latest` 上运行 `pnpm install --frozen-lockfile`、`pnpm test`、`pnpm tauri build`，并把安装包上传为 artifact。
+工作流在 `windows-latest` 上运行 `pnpm install --frozen-lockfile`、`pnpm test`、`pnpm tauri build`，并把安装包上传为 artifact（tag 触发时同时创建 GitHub Release）。
 
-下载方式：
+artifact 下载方式（需登录 GitHub 账号）：
 
 1. 打开仓库的 **Actions** 页，进入对应的 `build` 运行；
 2. 在页面底部 **Artifacts** 区域下载 `zcode-count-windows`；
