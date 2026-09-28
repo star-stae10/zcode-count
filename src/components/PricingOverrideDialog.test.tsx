@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { MatchedCount, PricingOverrideDialog, SaveNotice, validatePrices } from "./PricingOverrideDialog";
+import { MatchedCount, PeakBadge, PricingOverrideDialog, SaveNotice, prefillPeak, validatePrices } from "./PricingOverrideDialog";
+import { PriceOverride } from "../lib/api";
 
 describe("PricingOverrideDialog", () => {
   it("renders provider options, four price inputs and save button", () => {
@@ -46,6 +47,46 @@ describe("PricingOverrideDialog", () => {
       <PricingOverrideDialog providers={["p1"]} names={{}} onClose={() => {}} onChanged={() => {}} />,
     );
     expect(html).toContain("命中记录数");
+  });
+});
+
+describe("峰谷定价（DeepSeek 峰谷适配）", () => {
+  const peakRow: PriceOverride = {
+    provider_id: "deepseek", model_id: "deepseek-v4.1-flash",
+    input: "0.15", output: "0.6", cache_read: "0.003", cache_creation: "0.15",
+    peak_input: "0.3", peak_output: "1.2", peak_cache_read: "0.006", peak_cache_creation: "0.3",
+    matched_count: 5,
+  };
+
+  it("默认含「适配 DeepSeek 峰谷定价」按钮与「空闲时段单价」标签，不展开高峰时段单价输入", () => {
+    const html = renderToStaticMarkup(
+      <PricingOverrideDialog providers={["deepseek"]} names={{}} onClose={() => {}} onChanged={() => {}} />,
+    );
+    expect(html).toContain("适配 DeepSeek 峰谷定价");
+    expect(html).toContain("空闲时段单价");
+    expect(html).not.toContain("高峰时段单价");
+    // 默认未启用峰谷，按钮文案不应是「关闭峰谷定价」
+    expect(html).not.toContain("关闭峰谷定价");
+  });
+
+  it("PeakBadge：高峰四价齐全的覆盖显示「峰谷」徽标，半填或全空不显示", () => {
+    expect(renderToStaticMarkup(<PeakBadge row={peakRow} />)).toContain("峰谷");
+    const half = { ...peakRow, peak_output: null };
+    expect(renderToStaticMarkup(<PeakBadge row={half} />)).not.toContain("峰谷");
+    const none: PriceOverride = {
+      ...peakRow,
+      peak_input: null, peak_output: null, peak_cache_read: null, peak_cache_creation: null,
+    };
+    expect(renderToStaticMarkup(<PeakBadge row={none} />)).not.toContain("峰谷");
+  });
+
+  it("prefillPeak：空闲四价均已填且有效时按「高峰 = 空闲 ×2」预填，否则不预填", () => {
+    expect(prefillPeak("0.15", "0.6", "0.003", "1")).toEqual(["0.3", "1.2", "0.006", "2"]);
+    // 空闲组任一未填 → 不预填
+    expect(prefillPeak("", "0.6", "0.003", "1")).toBeNull();
+    expect(prefillPeak("0.15", "0.6", "0.003", "")).toBeNull();
+    // 非数字 → 不预填
+    expect(prefillPeak("abc", "0.6", "0.003", "1")).toBeNull();
   });
 });
 

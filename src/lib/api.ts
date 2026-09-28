@@ -14,6 +14,8 @@ export interface RequestLogRow {
   duration_ms: number | null; first_token_ms: number | null;
   status: string; started_at: number;
   query_source: string | null;
+  /** 计费档（后端判档，前端只渲染）："peak" | "off_peak"；null = 未启用峰谷覆盖或未定价。 */
+  price_tier: string | null;
 }
 export interface ProviderStat {
   provider_id: string; request_count: number;
@@ -33,6 +35,9 @@ export interface SyncStatus {
 export interface PriceOverride {
   provider_id: string; model_id: string;
   input: string; output: string; cache_read: string; cache_creation: string;
+  /** 高峰时段单价（null = 未启用峰谷定价）。 */
+  peak_input: string | null; peak_output: string | null;
+  peak_cache_read: string | null; peak_cache_creation: string | null;
   /** 该覆盖当前命中的用量记录条数（0 = 未生效，需检查模型 ID 是否与记录一致）。 */
   matched_count: number;
 }
@@ -126,8 +131,19 @@ export const listAuditLogs = (limit: number) =>
   invoke<AuditLogRow[]>("list_audit_logs", { limit });
 
 // 注意：Tauri v2 参数默认 camelCase 映射到 Rust 的 snake_case。
-export const setPriceOverride = (providerId: string, modelId: string, input: string, output: string, cacheRead: string, cacheCreation: string) =>
-  invoke<number>("set_price_override", { providerId, modelId, input, output, cacheRead, cacheCreation });
+// 峰谷 4 参可选：启用峰谷定价时四者一起传，未启用时全部不传（后端写 NULL，即关闭峰谷）。
+export const setPriceOverride = (
+  providerId: string, modelId: string,
+  input: string, output: string, cacheRead: string, cacheCreation: string,
+  peakInput?: string, peakOutput?: string, peakCacheRead?: string, peakCacheCreation?: string,
+) => {
+  const withPeak = peakInput !== undefined && peakOutput !== undefined
+    && peakCacheRead !== undefined && peakCacheCreation !== undefined;
+  return invoke<number>("set_price_override", {
+    providerId, modelId, input, output, cacheRead, cacheCreation,
+    ...(withPeak ? { peakInput, peakOutput, peakCacheRead, peakCacheCreation } : {}),
+  });
+};
 export const listPriceOverrides = () => invoke<PriceOverride[]>("list_price_overrides");
 export const deletePriceOverride = (providerId: string, modelId: string) =>
   invoke<number>("delete_price_override", { providerId, modelId });

@@ -41,6 +41,34 @@ export function validatePrices(input: string, output: string, cacheRead: string,
   return null;
 }
 
+/**
+ * 「高峰 = 空闲 ×2」预填规则（官方 DeepSeek 峰谷价规则，仅便利预填，可手动修改）：
+ * 空闲四价均已填且为有效数字时返回翻倍结果；否则返回 null（不预填）。
+ */
+export function prefillPeak(
+  input: string, output: string, cacheRead: string, cacheCreation: string,
+): [string, string, string, string] | null {
+  const vals = [input, output, cacheRead, cacheCreation].map((s) => s.trim());
+  if (vals.some((s) => s === "")) return null;
+  const nums = vals.map(Number);
+  if (nums.some((v) => !Number.isFinite(v))) return null;
+  return [String(nums[0] * 2), String(nums[1] * 2), String(nums[2] * 2), String(nums[3] * 2)];
+}
+
+/**
+ * 峰谷徽标：覆盖启用高峰时段单价（四个高峰单价齐全，与后端防御口径一致）时
+ * 显示在覆盖列表的模型名旁。
+ */
+export function PeakBadge({ row }: { row: PriceOverride }) {
+  if (
+    row.peak_input == null || row.peak_output == null ||
+    row.peak_cache_read == null || row.peak_cache_creation == null
+  ) {
+    return null;
+  }
+  return <span className="ml-1 rounded bg-blue-50 px-1 text-xs text-blue-600">峰谷</span>;
+}
+
 export function PricingOverrideDialog(props: {
   providers: string[]; names: ProviderNames; onClose: () => void; onChanged: () => void;
   initialProvider?: string; initialModel?: string;
@@ -58,6 +86,12 @@ export function PricingOverrideDialog(props: {
   const [output, setOutput] = useState("");
   const [cacheRead, setCacheRead] = useState("");
   const [cacheCreation, setCacheCreation] = useState("");
+  // 峰谷定价（DeepSeek）：展开态 + 高峰时段四价。展开且提交 = 启用；收起提交 = 关闭（peak 全不传）。
+  const [peakEnabled, setPeakEnabled] = useState(false);
+  const [peakInput, setPeakInput] = useState("");
+  const [peakOutput, setPeakOutput] = useState("");
+  const [peakCacheRead, setPeakCacheRead] = useState("");
+  const [peakCacheCreation, setPeakCacheCreation] = useState("");
   const [rows, setRows] = useState<PriceOverride[]>([]);
   const [error, setError] = useState<string | null>(null);
   // 最近一次保存的重算条数（null = 尚未保存）
@@ -77,15 +111,43 @@ export function PricingOverrideDialog(props: {
 
   useEffect(() => { void load(); }, []);
 
+  /** 展开/收起峰谷组：展开时若峰谷价全空且空闲四价已填，按「高峰 = 空闲 ×2」预填（不覆盖已有值）。 */
+  function togglePeak() {
+    if (peakEnabled) {
+      setPeakEnabled(false);
+      return;
+    }
+    if (peakInput === "" && peakOutput === "" && peakCacheRead === "" && peakCacheCreation === "") {
+      const pre = prefillPeak(input, output, cacheRead, cacheCreation);
+      if (pre) {
+        setPeakInput(pre[0]);
+        setPeakOutput(pre[1]);
+        setPeakCacheRead(pre[2]);
+        setPeakCacheCreation(pre[3]);
+      }
+    }
+    setPeakEnabled(true);
+  }
+
   async function save() {
     const invalid = validatePrices(input, output, cacheRead, cacheCreation);
     if (invalid) { setError(invalid); return; }
+    if (peakEnabled) {
+      const peakInvalid = validatePrices(peakInput, peakOutput, peakCacheRead, peakCacheCreation);
+      if (peakInvalid) { setError(`高峰时段：${peakInvalid}`); return; }
+    }
     if (!providerId) { setError("请填写供应商"); return; }
     if (!modelId.trim()) { setError("请填写模型 ID"); return; }
     setSaving(true);
     try {
-      const repriced = await setPriceOverride(providerId, modelId.trim(), input, output, cacheRead, cacheCreation);
+      // 峰谷展开时四参一起传（启用）；收起时不传（关闭峰谷，普通覆盖价保留）。
+      const repriced = peakEnabled
+        ? await setPriceOverride(providerId, modelId.trim(), input, output, cacheRead, cacheCreation,
+            peakInput, peakOutput, peakCacheRead, peakCacheCreation)
+        : await setPriceOverride(providerId, modelId.trim(), input, output, cacheRead, cacheCreation);
       setModelId(""); setInput(""); setOutput(""); setCacheRead(""); setCacheCreation("");
+      setPeakEnabled(false);
+      setPeakInput(""); setPeakOutput(""); setPeakCacheRead(""); setPeakCacheCreation("");
       setError(null);
       setSaveNotice(repriced);
       await load();
@@ -129,6 +191,12 @@ export function PricingOverrideDialog(props: {
           按「供应商 + 模型」指定单价（每百万 token 的美元数），覆盖优先于 cc-switch 定价表。允许 0，不可为负。
         </p>
 
+        <div className="mb-2 flex items-center gap-2">
+          <span className="text-xs font-medium text-gray-500">空闲时段单价</span>
+          <button onClick={togglePeak} className="rounded bg-blue-50 px-2 py-1 text-xs text-blue-600">
+            {peakEnabled ? "关闭峰谷定价" : "适配 DeepSeek 峰谷定价"}
+          </button>
+        </div>
         <div className="mb-3 grid grid-cols-2 gap-2 md:grid-cols-3">
           <label className="flex flex-col gap-1 text-xs text-gray-500">
             供应商
@@ -161,6 +229,18 @@ export function PricingOverrideDialog(props: {
           {num(cacheRead, setCacheRead, "缓存读取单价")}
           {num(cacheCreation, setCacheCreation, "缓存创建单价")}
         </div>
+
+        {peakEnabled && (
+          <div className="mb-3">
+            <div className="mb-2 text-xs font-medium text-gray-500">高峰时段单价</div>
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
+              {num(peakInput, setPeakInput, "输入单价")}
+              {num(peakOutput, setPeakOutput, "输出单价")}
+              {num(peakCacheRead, setPeakCacheRead, "缓存读取单价")}
+              {num(peakCacheCreation, setPeakCacheCreation, "缓存创建单价")}
+            </div>
+          </div>
+        )}
 
         <div className="mb-3 flex items-center gap-2">
           <button onClick={save} disabled={saving}
@@ -198,7 +278,10 @@ export function PricingOverrideDialog(props: {
                     <td className="py-2 pr-4" title={props.names[r.provider_id] != null ? r.provider_id : undefined}>
                       {r.provider_id ? providerLabel(props.names, r.provider_id) : "(未指定)"}
                     </td>
-                    <td className="py-2 pr-4">{r.model_id}</td>
+                    <td className="py-2 pr-4">
+                      {r.model_id}
+                      <PeakBadge row={r} />
+                    </td>
                     <td className="py-2 pr-4">{r.input}</td>
                     <td className="py-2 pr-4">{r.output}</td>
                     <td className="py-2 pr-4">{r.cache_read}</td>

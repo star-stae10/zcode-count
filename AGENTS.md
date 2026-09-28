@@ -43,8 +43,9 @@ src-tauri/src/
 │                    #   + 审计（insert_audit_log/list_audit_logs）+ 墓碑（list_tombstones/is_tombstoned）
 │                    #   + 未定价清单（query_unpriced_models，含成本估算区间）+ 层级（list_provider_models）
 ├─ pricing/
-│  ├─ mod.rs         # ModelPricing、cc_switch_db_path()、resolve()
-│  ├─ candidates.rs  # model_candidates()：模型名归一化
+│  ├─ mod.rs         # ModelPricing、TieredPricing{off_peak,peak}+pick()、cc_switch_db_path()、override_lookup()、resolve()（返回 TieredPricing）
+│  ├─ candidates.rs  # model_candidates()：模型名归一化（全仓库唯一归一化规则源）
+│  ├─ tier.rs        # is_peak(started_at_ms)：DeepSeek 峰谷判档纯函数（UTC+8、周一至五 9-12/14-18、节假日内置表 2026-09-01~2027-01-31；不引入 chrono）
 │  ├─ cost.rs        # calculate_cache_inclusive()：成本计算
 │  └─ table.rs       # PricingTable：load(只读) / from_rows / lookup(精确→前缀)
 └─ zcode/
@@ -133,6 +134,8 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 14. **覆盖匹配口径统一（单一规则源）**：`pricing::override_lookup` = 先 `(provider, model)` 精确、再按 `model_candidates` 归一化候选匹配，provider 恒精确、空候选覆盖跳过、精确优先。`resolve()` 内部改调它（签名不变）；sync 覆盖重算 pass（`list_models_for_provider` + `override_lookup` 判定命中）与删除覆盖清理（`delete_override_and_clear`）同口径。**禁止在别处另写匹配逻辑**——历史教训：覆盖曾用精确匹配而表价用归一化，同一规则被复制三份导致覆盖静默失效。`OverrideRow.matched_count` 也必须复用 `override_lookup` 计算。
 
+15. **DeepSeek 峰谷定价（以定价覆盖为载体，已获所有者确认实施）**：`pricing_overrides` 可选带 4 个 peak 单价列（NULL = 未启用峰谷）；启用组合由 `TieredPricing::pick(started_at)` 按行判档选价，历史由覆盖重算 pass 全量回填；判档只在 `pricing/tier.rs` 一处（前端「计费档」列由 `list_logs` 命令后处理标注，前端零判档逻辑）。峰/谷两组价全部由用户手填（不依赖 cc-switch 表价口径）；`set_price_override` 的 peak 四参数全填=启用、全空=关闭（普通覆盖价保留）、部分填=报错。节假日表仅覆盖 2026-09-01~2027-01-31（国办发明电〔2025〕7号），**2027-02 起按周几退化，需手动维护 tier.rs**。真实数据对账：双实现互验差异 0.0000%，峰谷较旧单一空闲档 +10.59%（本机窗口）。
+
 ## 5. 数据源 schema 速查
 
 **ZCode `model_usage`**（只读）：`id, provider_id, model_id, query_source, status, started_at(ms), completed_at, duration_ms, time_to_first_token_ms, input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, provider_total_tokens, computed_total_tokens, session_id, ...`
@@ -142,7 +145,7 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 **自有库 `usage_records`**：`request_id(PK), app_type, provider_id, model_id, query_source, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, total_cost_usd, priced, started_at, duration_ms, first_token_ms, status, session_id, created_at`
 
 **`sync_cursors`**：`source(PK, ZCode库路径), last_started_at, last_mtime, last_synced_at`
-**`pricing_overrides`**：`(provider_id, model_id)(PK) + 四个单价`（UI：工具栏「定价覆盖」弹窗）
+**`pricing_overrides`**：`(provider_id, model_id)(PK) + 四个单价 + 四个峰段单价(peak_*，NULL=未启用峰谷)`（UI：工具栏「定价覆盖」弹窗，「适配 DeepSeek 峰谷定价」按钮）
 **`provider_names`**：`provider_id(PK), display_name, source('zcode_config'|'manual'), base_url, first_seen_at, updated_at`（sync 快照 upsert，只增不删）
 **`audit_log`**：`id, actor(操作人), action('clear_usage'), started_at_from/to(时间段,可 NULL), providers(JSON 数组), models(JSON 数组 [{provider_id,model_id}]), deleted_count, created_at`
 **`clear_tombstones`**：`id, ts_from, ts_to(闭区间,ms), provider_id(NULL=不限), model_id(NULL=该供应商下不限), created_at`
@@ -187,7 +190,7 @@ CI：`.github/workflows/build.yml`，`windows-latest`，跑 `cargo test` + `pnpm
 - **迁移无 `PRAGMA user_version`**：靠 ad-hoc 列检查。
 - **`formatCost` 对极小金额显示 `$0.00000`**（5 位小数）。
 - **CI**：actions 有 Node 20 deprecation 警告（不影响构建）；可考虑升级 action 版本。
-- **DeepSeek 峰谷定价未适配**：现状按单一空闲档计价，DeepSeek 系成本低估约 13%（阈值 1.5%）。待办见根目录 `todo.md` —— 🔴 **须经仓库所有者明确同意后 AI 才可实施，禁止擅自实现。**
+- **峰谷节假日表需手动维护**：`pricing/tier.rs` 的 `HOLIDAY_DAYS` 仅覆盖 2026-09-01~2027-01-31（所有者确认范围），2027-02 起按周几退化判定（周末节假日会被当工作日峰段计价）；跨年后须按国办最新安排补表。
 
 ## 9. 历史留档
 

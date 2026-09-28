@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::pricing::{override_lookup, ModelPricing};
+use crate::pricing::{override_lookup, ModelPricing, TieredPricing};
 use crate::zcode::provider_names::ProviderName;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -148,6 +148,9 @@ pub struct RequestLogRow {
     pub status: String,
     pub started_at: i64,
     pub query_source: Option<String>,
+    /// 计费档（"peak" | "off_peak"；None = 未启用峰谷的组合或未定价行）。
+    /// 不存库，由 `annotate_price_tiers` 在查询后统一标注。
+    pub price_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -201,12 +204,14 @@ pub struct UnpricedRecord {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    /// 重定价按行判档（峰谷）需要请求开始时刻。
+    pub started_at: i64,
 }
 
 pub fn query_unpriced_records(conn: &Connection) -> Result<Vec<UnpricedRecord>, AppError> {
     let mut stmt = conn.prepare(
         "SELECT request_id, provider_id, model_id, input_tokens, output_tokens,
-                cache_read_tokens, cache_creation_tokens
+                cache_read_tokens, cache_creation_tokens, started_at
          FROM usage_records WHERE priced = 0",
     )?;
     let it = stmt.query_map([], |row| {
@@ -218,6 +223,7 @@ pub fn query_unpriced_records(conn: &Connection) -> Result<Vec<UnpricedRecord>, 
             output_tokens: row.get(4)?,
             cache_read_tokens: row.get(5)?,
             cache_creation_tokens: row.get(6)?,
+            started_at: row.get(7)?,
         })
     })?;
     let mut out = Vec::new();
@@ -233,6 +239,8 @@ pub struct RepriceRow {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    /// 重定价按行判档（峰谷）需要请求开始时刻。
+    pub started_at: i64,
 }
 
 /// 取某 `(provider_id, model_id)` 组合的**全部**行（含已定价），供覆盖重算使用。
@@ -240,7 +248,7 @@ pub fn query_records_by_provider_model(
     conn: &Connection, provider_id: &str, model_id: &str,
 ) -> Result<Vec<RepriceRow>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT request_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+        "SELECT request_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, started_at
          FROM usage_records WHERE provider_id = ?1 AND model_id = ?2",
     )?;
     let it = stmt.query_map(params![provider_id, model_id], |row| {
@@ -250,6 +258,7 @@ pub fn query_records_by_provider_model(
             output_tokens: row.get(2)?,
             cache_read_tokens: row.get(3)?,
             cache_creation_tokens: row.get(4)?,
+            started_at: row.get(5)?,
         })
     })?;
     let mut out = Vec::new();
@@ -373,11 +382,37 @@ pub fn query_logs(conn: &Connection, since: i64, until: i64, scope: Option<&Scop
             status: row.get(10)?,
             started_at: row.get(11)?,
             query_source: row.get(12)?,
+            price_tier: None,
         })
     })?;
     let mut rows = Vec::new();
     for r in it { rows.push(r?); }
     Ok(rows)
+}
+
+/// 请求日志的「计费档」标注：对已定价且其覆盖**启用峰谷**的行，按
+/// `pricing::tier::is_peak(started_at)` 标注 "peak" / "off_peak"；其余行
+/// （未定价、普通覆盖、表价）保持 None。
+///
+/// 匹配口径与 resolve 完全一致（统一走 `override_lookup` 归一化匹配），
+/// 保证「按峰谷价计算」与「标注峰谷档」不会漂移。
+pub fn annotate_price_tiers(
+    rows: &mut [RequestLogRow],
+    overrides: &HashMap<(String, String), TieredPricing>,
+) {
+    for r in rows.iter_mut() {
+        if !r.priced {
+            continue;
+        }
+        if let Some(tp) = override_lookup(&r.provider_id, &r.model_id, overrides) {
+            if tp.peak.is_some() {
+                r.price_tier = Some(
+                    if crate::pricing::tier::is_peak(r.started_at) { "peak" } else { "off_peak" }
+                        .to_string(),
+                );
+            }
+        }
+    }
 }
 
 fn group_stats(conn: &Connection, key: &str, since: i64, until: i64, scope: Option<&ScopeFilter>) -> Result<Vec<(String, i64, i64, i64, String, i64)>, AppError> {
@@ -454,7 +489,7 @@ pub fn query_model_stats(conn: &Connection, since: i64, until: i64, scope: Optio
         .collect())
 }
 
-/// 供 UI 展示的覆盖行（单价以字符串原样返回）。
+/// 供 UI 展示的覆盖行（单价以字符串原样返回；peak 四列为 None = 未启用峰谷）。
 #[derive(Debug, Clone, Serialize)]
 pub struct OverrideRow {
     pub provider_id: String,
@@ -463,17 +498,48 @@ pub struct OverrideRow {
     pub output: String,
     pub cache_read: String,
     pub cache_creation: String,
+    pub peak_input: Option<String>,
+    pub peak_output: Option<String>,
+    pub peak_cache_read: Option<String>,
+    pub peak_cache_creation: Option<String>,
     /// 该覆盖当前按归一化口径命中的记录数（与 resolve 的 override_lookup
     /// 完全同口径计算；0 表示覆盖不生效，前端应红字提示）。
     pub matched_count: i64,
 }
 
-pub fn get_overrides(conn: &Connection) -> Result<HashMap<(String, String), ModelPricing>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT provider_id, model_id, input_cost_per_million, output_cost_per_million,
-                cache_read_cost_per_million, cache_creation_cost_per_million
-         FROM pricing_overrides",
-    )?;
+/// 把覆盖行的原始单价字符串解析为 `TieredPricing`：空闲四价解析失败 → None
+/// （该覆盖在 resolve 中不会生效）；peak 四列必须**全部**非 NULL 且解析成功
+/// 才置 `peak = Some`，否则 None（防御半填 / 损坏数据）。
+fn parse_tiered(
+    i: &str, o: &str, cr: &str, cc: &str,
+    pi: Option<&str>, po: Option<&str>, pcr: Option<&str>, pcc: Option<&str>,
+) -> Option<TieredPricing> {
+    let off_peak = ModelPricing::from_strings(i, o, cr, cc).ok()?;
+    let peak = match (pi, po, pcr, pcc) {
+        (Some(a), Some(b), Some(c), Some(d)) => ModelPricing::from_strings(a, b, c, d).ok(),
+        _ => None,
+    };
+    Some(TieredPricing { off_peak, peak })
+}
+
+/// 覆盖 SELECT 的公共列（空闲四价 + peak 四价）。
+const OVERRIDE_COLUMNS: &str =
+    "provider_id, model_id, input_cost_per_million, output_cost_per_million,
+     cache_read_cost_per_million, cache_creation_cost_per_million,
+     peak_input_cost_per_million, peak_output_cost_per_million,
+     peak_cache_read_cost_per_million, peak_cache_creation_cost_per_million";
+
+type OverrideRaw = (
+    String, String, String, String, String, String,
+    Option<String>, Option<String>, Option<String>, Option<String>,
+);
+
+fn query_override_rows(conn: &Connection, order: bool) -> Result<Vec<OverrideRaw>, AppError> {
+    let sql = format!(
+        "SELECT {OVERRIDE_COLUMNS} FROM pricing_overrides{}",
+        if order { " ORDER BY provider_id, model_id" } else { "" },
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let it = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -482,46 +548,42 @@ pub fn get_overrides(conn: &Connection) -> Result<HashMap<(String, String), Mode
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
+}
+
+pub fn get_overrides(conn: &Connection) -> Result<HashMap<(String, String), TieredPricing>, AppError> {
     let mut map = HashMap::new();
-    for r in it {
-        let (pid, mid, i, o, cr, cc) = r?;
-        if let Ok(p) = ModelPricing::from_strings(&i, &o, &cr, &cc) {
-            map.insert((pid, mid), p);
+    for (pid, mid, i, o, cr, cc, pi, po, pcr, pcc) in query_override_rows(conn, false)? {
+        if let Some(tp) = parse_tiered(&i, &o, &cr, &cc, pi.as_deref(), po.as_deref(), pcr.as_deref(), pcc.as_deref()) {
+            map.insert((pid, mid), tp);
         }
     }
     Ok(map)
 }
 
 pub fn list_overrides(conn: &Connection) -> Result<Vec<OverrideRow>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT provider_id, model_id, input_cost_per_million, output_cost_per_million,
-                cache_read_cost_per_million, cache_creation_cost_per_million
-         FROM pricing_overrides ORDER BY provider_id, model_id",
-    )?;
-    let it = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-        ))
-    })?;
     let mut out = Vec::new();
-    for r in it {
-        let (pid, mid, i, o, cr, cc) = r?;
+    for (pid, mid, i, o, cr, cc, pi, po, pcr, pcc) in query_override_rows(conn, true)? {
         // 命中数必须用与 resolve 相同的 override_lookup 计算（口径唯一）：
         // 以该覆盖为唯一覆盖项，判定该 provider 下每个 DISTINCT model_id 是否命中。
-        let matched_count = match ModelPricing::from_strings(&i, &o, &cr, &cc) {
-            Ok(p) => {
+        let matched_count = match parse_tiered(
+            &i, &o, &cr, &cc,
+            pi.as_deref(), po.as_deref(), pcr.as_deref(), pcc.as_deref(),
+        ) {
+            Some(tp) => {
                 let mut single = HashMap::new();
-                single.insert((pid.clone(), mid.clone()), p);
+                single.insert((pid.clone(), mid.clone()), tp);
                 count_matched_records(conn, &pid, &single)?
             }
-            Err(_) => 0, // 单价损坏的覆盖不会在 resolve 中生效，视为 0 命中
+            None => 0, // 单价损坏的覆盖不会在 resolve 中生效，视为 0 命中
         };
         out.push(OverrideRow {
             provider_id: pid,
@@ -530,6 +592,10 @@ pub fn list_overrides(conn: &Connection) -> Result<Vec<OverrideRow>, AppError> {
             output: o,
             cache_read: cr,
             cache_creation: cc,
+            peak_input: pi,
+            peak_output: po,
+            peak_cache_read: pcr,
+            peak_cache_creation: pcc,
             matched_count,
         });
     }
@@ -540,7 +606,7 @@ pub fn list_overrides(conn: &Connection) -> Result<Vec<OverrideRow>, AppError> {
 fn count_matched_records(
     conn: &Connection,
     provider_id: &str,
-    single: &HashMap<(String, String), ModelPricing>,
+    single: &HashMap<(String, String), TieredPricing>,
 ) -> Result<i64, AppError> {
     let mut total = 0i64;
     for m in list_models_for_provider(conn, provider_id)? {
@@ -556,20 +622,35 @@ fn count_matched_records(
     Ok(total)
 }
 
-pub fn set_override(conn: &Connection, provider_id: &str, model_id: &str, p: &ModelPricing) -> Result<(), AppError> {
+/// 写入「供应商 + 模型」的覆盖。`peak` 为 Some 启用峰谷双档（高峰四价），
+/// None 关闭峰谷（peak 列写 NULL，普通覆盖价保留）。
+pub fn set_override(
+    conn: &Connection, provider_id: &str, model_id: &str,
+    p: &ModelPricing, peak: Option<&ModelPricing>,
+) -> Result<(), AppError> {
     conn.execute(
         "INSERT INTO pricing_overrides (provider_id, model_id, input_cost_per_million, output_cost_per_million,
-            cache_read_cost_per_million, cache_creation_cost_per_million)
-         VALUES (?1,?2,?3,?4,?5,?6)
+            cache_read_cost_per_million, cache_creation_cost_per_million,
+            peak_input_cost_per_million, peak_output_cost_per_million,
+            peak_cache_read_cost_per_million, peak_cache_creation_cost_per_million)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
          ON CONFLICT(provider_id, model_id) DO UPDATE SET
            input_cost_per_million = excluded.input_cost_per_million,
            output_cost_per_million = excluded.output_cost_per_million,
            cache_read_cost_per_million = excluded.cache_read_cost_per_million,
-           cache_creation_cost_per_million = excluded.cache_creation_cost_per_million",
+           cache_creation_cost_per_million = excluded.cache_creation_cost_per_million,
+           peak_input_cost_per_million = excluded.peak_input_cost_per_million,
+           peak_output_cost_per_million = excluded.peak_output_cost_per_million,
+           peak_cache_read_cost_per_million = excluded.peak_cache_read_cost_per_million,
+           peak_cache_creation_cost_per_million = excluded.peak_cache_creation_cost_per_million",
         params![
             provider_id, model_id,
             p.input.to_string(), p.output.to_string(),
-            p.cache_read.to_string(), p.cache_creation.to_string()
+            p.cache_read.to_string(), p.cache_creation.to_string(),
+            peak.map(|x| x.input.to_string()),
+            peak.map(|x| x.output.to_string()),
+            peak.map(|x| x.cache_read.to_string()),
+            peak.map(|x| x.cache_creation.to_string()),
         ],
     )?;
     Ok(())
@@ -627,9 +708,9 @@ pub fn delete_override_and_clear(
 ) -> Result<usize, AppError> {
     // 删除前先取该覆盖的价格，构造单覆盖 map 用于归一化匹配其影响范围。
     let all = get_overrides(conn)?;
-    let mut removed: HashMap<(String, String), ModelPricing> = HashMap::new();
-    if let Some(p) = all.get(&(provider_id.to_string(), model_id.to_string())) {
-        removed.insert((provider_id.to_string(), model_id.to_string()), p.clone());
+    let mut removed: HashMap<(String, String), TieredPricing> = HashMap::new();
+    if let Some(tp) = all.get(&(provider_id.to_string(), model_id.to_string())) {
+        removed.insert((provider_id.to_string(), model_id.to_string()), tp.clone());
     }
     delete_override(conn, provider_id, model_id)?;
     if removed.is_empty() {
@@ -1343,22 +1424,23 @@ mod tests {
             cache_read: Decimal::from_str("0.006").unwrap(),
             cache_creation: Decimal::ZERO,
         };
-        set_override(&c, "p1", "m1", &p).unwrap();
+        set_override(&c, "p1", "m1", &p, None).unwrap();
         // 同一模型不同供应商是两条独立记录
         let p2 = ModelPricing { input: Decimal::from_str("9").unwrap(), ..p.clone() };
-        set_override(&c, "p2", "m1", &p2).unwrap();
+        set_override(&c, "p2", "m1", &p2, None).unwrap();
 
         let map = get_overrides(&c).unwrap();
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get(&("p1".into(), "m1".into())).unwrap().input, p.input);
-        assert_eq!(map.get(&("p2".into(), "m1".into())).unwrap().input, p2.input);
+        assert_eq!(map.get(&("p1".into(), "m1".into())).unwrap().off_peak.input, p.input);
+        assert_eq!(map.get(&("p2".into(), "m1".into())).unwrap().off_peak.input, p2.input);
+        assert!(map.values().all(|tp| tp.peak.is_none()), "未启用峰谷的覆盖 peak 应为 None");
 
         // UPSERT：同键再写覆盖单价
         let p3 = ModelPricing { input: Decimal::from_str("0.5").unwrap(), ..p.clone() };
-        set_override(&c, "p1", "m1", &p3).unwrap();
+        set_override(&c, "p1", "m1", &p3, None).unwrap();
         let map = get_overrides(&c).unwrap();
         assert_eq!(map.len(), 2, "UPSERT 不应新增行");
-        assert_eq!(map.get(&("p1".into(), "m1".into())).unwrap().input, p3.input);
+        assert_eq!(map.get(&("p1".into(), "m1".into())).unwrap().off_peak.input, p3.input);
     }
 
     #[test]
@@ -1370,8 +1452,8 @@ mod tests {
             cache_read: Decimal::from_str("0.006").unwrap(),
             cache_creation: Decimal::ZERO,
         };
-        set_override(&c, "p2", "m2", &p).unwrap();
-        set_override(&c, "p1", "m1", &p).unwrap();
+        set_override(&c, "p2", "m2", &p, None).unwrap();
+        set_override(&c, "p1", "m1", &p, None).unwrap();
 
         let rows = list_overrides(&c).unwrap();
         assert_eq!(rows.len(), 2);
@@ -1439,7 +1521,7 @@ mod tests {
         insert_record(&c, &z).unwrap();
         insert_record(&c, &other_p).unwrap();
 
-        set_override(&c, "p1", "deepseek-v4.1-flash", &override_price()).unwrap();
+        set_override(&c, "p1", "deepseek-v4.1-flash", &override_price(), None).unwrap();
         // 列表视图的命中数应为 2（x + y，跨命名空间同口径）
         let rows = list_overrides(&c).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1581,6 +1663,10 @@ mod tests {
         let mut ids: Vec<&str> = rows.iter().map(|r| r.request_id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"], "只取目标组合的所有行（含 priced=0）");
+        // started_at 供覆盖重算按行判档（峰谷）
+        let a = rows.iter().find(|r| r.request_id == "a").unwrap();
+        let b = rows.iter().find(|r| r.request_id == "b").unwrap();
+        assert_eq!((a.started_at, b.started_at), (10, 20));
 
         let empty = query_records_by_provider_model(&c, "p1", "nope").unwrap();
         assert!(empty.is_empty());
@@ -1781,5 +1867,149 @@ mod tests {
         assert_eq!(pairs, vec![
             ("p1".into(), "m1".into()), ("p1".into(), "m2".into()), ("p2".into(), "m1".into()),
         ], "去重且按 provider、model 排序");
+    }
+
+    // -- 峰谷定价（DeepSeek 峰谷覆盖）----------------------------------------
+
+    /// 高峰档价（空闲价 ×2 的官方参考口径）。
+    fn peak_price() -> ModelPricing {
+        ModelPricing {
+            input: Decimal::from_str("0.3").unwrap(),
+            output: Decimal::from_str("1.2").unwrap(),
+            cache_read: Decimal::from_str("0.006").unwrap(),
+            cache_creation: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn set_override_with_peak_roundtrip_and_disable() {
+        let c = conn();
+        let off = override_price();
+        let peak = peak_price();
+
+        // 启用峰谷：存取往返，两组价各自精确还原
+        set_override(&c, "p1", "m1", &off, Some(&peak)).unwrap();
+        let got = get_overrides(&c).unwrap().get(&("p1".into(), "m1".into())).cloned().unwrap();
+        assert_eq!(got.off_peak, off);
+        assert_eq!(got.peak, Some(peak));
+
+        // 关闭峰谷：peak 列写 NULL，普通覆盖价必须保留
+        set_override(&c, "p1", "m1", &off, None).unwrap();
+        let got = get_overrides(&c).unwrap().get(&("p1".into(), "m1".into())).cloned().unwrap();
+        assert_eq!(got.off_peak, off, "关闭峰谷后普通覆盖价必须保留");
+        assert_eq!(got.peak, None, "关闭峰谷后 peak 必须为 None");
+    }
+
+    /// 半填数据防御：peak 列部分 NULL 或解析失败 → peak 回落 None（未启用峰谷）。
+    #[test]
+    fn get_overrides_tolerates_half_filled_peak_columns() {
+        let c = conn();
+        let off = override_price();
+        set_override(&c, "p1", "m1", &off, Some(&peak_price())).unwrap();
+
+        // 部分 peak 列为 NULL
+        c.execute("UPDATE pricing_overrides SET peak_output_cost_per_million = NULL", []).unwrap();
+        let got = get_overrides(&c).unwrap().get(&("p1".into(), "m1".into())).cloned().unwrap();
+        assert_eq!(got.off_peak, off, "空闲组不受 peak 半填影响");
+        assert_eq!(got.peak, None, "peak 列半填 NULL 必须回落为未启用峰谷");
+
+        // peak 列损坏（解析失败）
+        c.execute("UPDATE pricing_overrides SET peak_output_cost_per_million = 'not-a-number'", []).unwrap();
+        let got = get_overrides(&c).unwrap().get(&("p1".into(), "m1".into())).cloned().unwrap();
+        assert_eq!(got.peak, None, "peak 值解析失败必须回落为未启用峰谷");
+    }
+
+    #[test]
+    fn list_overrides_exposes_peak_columns() {
+        let c = conn();
+        let off = override_price();
+        set_override(&c, "p1", "m1", &off, Some(&peak_price())).unwrap();
+        let rows = list_overrides(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].peak_input.as_deref(), Some("0.3"));
+        assert_eq!(rows[0].peak_output.as_deref(), Some("1.2"));
+        assert_eq!(rows[0].peak_cache_read.as_deref(), Some("0.006"));
+        assert_eq!(rows[0].peak_cache_creation.as_deref(), Some("0"));
+        assert_eq!(rows[0].matched_count, 0, "无用量记录时命中数为 0");
+
+        // 关闭峰谷 → peak 四列回 NULL
+        set_override(&c, "p1", "m1", &off, None).unwrap();
+        let rows = list_overrides(&c).unwrap();
+        assert!(
+            rows[0].peak_input.is_none() && rows[0].peak_output.is_none()
+                && rows[0].peak_cache_read.is_none() && rows[0].peak_cache_creation.is_none(),
+            "关闭峰谷后 peak 列应全部为 None"
+        );
+    }
+
+    /// 日志行工厂（annotate 测试用）。
+    fn log_row(id: &str, provider: &str, model: &str, started: i64, priced: bool) -> RequestLogRow {
+        RequestLogRow {
+            request_id: id.into(),
+            provider_id: provider.into(),
+            model_id: model.into(),
+            input_tokens: 1000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_cost_usd: if priced { "0.00015".into() } else { "0".into() },
+            priced,
+            duration_ms: None,
+            first_token_ms: None,
+            status: "completed".into(),
+            started_at: started,
+            query_source: None,
+            price_tier: None,
+        }
+    }
+
+    /// 计费档标注：仅「启用峰谷且已定价」的组合被标注，且按行判档；
+    /// 普通覆盖与未定价行保持 None。匹配走 override_lookup（归一化口径）。
+    #[test]
+    fn annotate_price_tiers_marks_only_peak_enabled_combo() {
+        // 2026-10-12 为周一（节假日表外的普通工作日），days_from_civil = 20738
+        const DAY: i64 = 86_400_000;
+        let peak_ts = 20_738 * DAY + 2 * 3_600_000;  // 北京 10:00
+        let off_ts = 20_738 * DAY + 11 * 3_600_000;  // 北京 19:00
+
+        let mut rows = vec![
+            log_row("a", "p1", "m1", peak_ts, true),
+            log_row("b", "p1", "m1", off_ts, true),
+            log_row("c", "p1", "m2", peak_ts, true),
+            log_row("d", "p1", "m1", peak_ts, false),
+        ];
+        assert!(crate::pricing::tier::is_peak(peak_ts), "测试前提：peak_ts 应判为峰档");
+        assert!(!crate::pricing::tier::is_peak(off_ts), "测试前提：off_ts 应判为谷档");
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            ("p1".to_string(), "m1".to_string()),
+            TieredPricing { off_peak: override_price(), peak: Some(peak_price()) },
+        );
+        // 普通覆盖（未启用峰谷）
+        overrides.insert(
+            ("p1".to_string(), "m2".to_string()),
+            TieredPricing { off_peak: override_price(), peak: None },
+        );
+        // 裸名峰谷覆盖：供命名空间记录归一化命中
+        overrides.insert(
+            ("p1".to_string(), "deepseek-v4.1-flash".to_string()),
+            TieredPricing { off_peak: override_price(), peak: Some(peak_price()) },
+        );
+
+        annotate_price_tiers(&mut rows, &overrides);
+        assert_eq!(rows[0].price_tier.as_deref(), Some("peak"), "峰段行应标注 peak");
+        assert_eq!(rows[1].price_tier.as_deref(), Some("off_peak"), "谷段行应标注 off_peak");
+        assert_eq!(rows[2].price_tier, None, "普通覆盖（未启用峰谷）不标注");
+        assert_eq!(rows[3].price_tier, None, "未定价行不标注");
+
+        // 覆盖键为裸名、记录为命名空间名：同口径命中并标注
+        let mut ns_rows = vec![log_row("e", "p1", "deepseek-ai/DeepSeek-V4.1-flash", peak_ts, true)];
+        annotate_price_tiers(&mut ns_rows, &overrides);
+        assert_eq!(ns_rows[0].price_tier.as_deref(), Some("peak"), "命名空间记录应经归一化命中并标注");
+
+        // 空 overrides：全部不标注
+        let mut plain = vec![log_row("f", "p1", "m1", peak_ts, true)];
+        annotate_price_tiers(&mut plain, &HashMap::new());
+        assert_eq!(plain[0].price_tier, None, "无覆盖时不得标注");
     }
 }

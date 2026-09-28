@@ -1,7 +1,7 @@
 use crate::db::dao::{self, UsageRecord};
 use crate::error::AppError;
 use crate::pricing::{
-    cost::calculate_cache_inclusive, override_lookup, resolve, table::PricingTable, ModelPricing,
+    cost::calculate_cache_inclusive, override_lookup, resolve, table::PricingTable, TieredPricing,
 };
 use crate::zcode::provider_names::ProviderName;
 use rusqlite::{Connection, OpenFlags};
@@ -49,7 +49,7 @@ pub fn sync(
     conn: &Connection,
     zcode_path: &Path,
     pricing: &PricingTable,
-    overrides: &HashMap<(String, String), ModelPricing>,
+    overrides: &HashMap<(String, String), TieredPricing>,
     names: &[ProviderName],
 ) -> Result<SyncReport, AppError> {
     // 供应商名称快照：必须在 mtime 短路判断之前执行——provider 改名/新增不会
@@ -100,7 +100,9 @@ pub fn sync(
                 continue;
             }
             let cost = resolve(&r.provider_id, &r.model_id, pricing, overrides)
-                .map(|p| calculate_cache_inclusive(r.input_tokens, r.output_tokens, r.cache_read, r.cache_creation, &p));
+                .map(|tp| calculate_cache_inclusive(
+                    r.input_tokens, r.output_tokens, r.cache_read, r.cache_creation,
+                    tp.pick(r.started_at)));
             let priced = cost.is_some();
             if !priced {
                 report.unpriced += 1;
@@ -158,12 +160,14 @@ pub fn sync(
         providers.dedup();
         for provider_id in providers {
             for model_id in dao::list_models_for_provider(conn, provider_id)? {
-                let Some(p) = override_lookup(provider_id, &model_id, overrides) else {
+                let Some(tp) = override_lookup(provider_id, &model_id, overrides) else {
                     continue;
                 };
                 for r in dao::query_records_by_provider_model(conn, provider_id, &model_id)? {
+                    // 按行 started_at 判档：峰谷覆盖的同一组合内峰段/谷段各按各的价
                     let c = calculate_cache_inclusive(
-                        r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens, &p);
+                        r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
+                        tp.pick(r.started_at));
                     dao::update_record_pricing(
                         conn, &r.request_id,
                         &c.input_cost.to_string(), &c.output_cost.to_string(),
@@ -179,9 +183,10 @@ pub fn sync(
     // (b) 表回填：修复已导入但当时无定价的行（priced=0）。
     if !pricing.is_empty() {
         for r in dao::query_unpriced_records(conn)? {
-            if let Some(p) = resolve(&r.provider_id, &r.model_id, pricing, overrides) {
+            if let Some(tp) = resolve(&r.provider_id, &r.model_id, pricing, overrides) {
                 let c = calculate_cache_inclusive(
-                    r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens, &p);
+                    r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
+                    tp.pick(r.started_at));
                 dao::update_record_pricing(
                     conn, &r.request_id,
                     &c.input_cost.to_string(), &c.output_cost.to_string(),
@@ -494,10 +499,7 @@ mod tests {
 
         // 第二次：设覆盖 (p1, m1) 输入价 1.0；ZCode 文件未变（mtime 短路），覆盖重算仍须执行。
         let mut overrides = HashMap::new();
-        overrides.insert(
-            ("p1".to_string(), "m1".to_string()),
-            ModelPricing { input: Decimal::from_str("1.0").unwrap(), ..pricing_zero() },
-        );
+        overrides.insert(("p1".to_string(), "m1".to_string()), tier_flat("1.0"));
         let second = sync(&conn, &zpath, &table, &overrides, &[]).unwrap();
         assert_eq!(second.repriced, 2, "该组合 2 行（含已定价行）都应重算");
 
@@ -510,10 +512,7 @@ mod tests {
 
         // 覆盖单独存在（pricing 表为空）也应触发重算。
         let mut overrides2 = HashMap::new();
-        overrides2.insert(
-            ("p1".to_string(), "m1".to_string()),
-            ModelPricing { input: Decimal::from_str("2.0").unwrap(), ..pricing_zero() },
-        );
+        overrides2.insert(("p1".to_string(), "m1".to_string()), tier_flat("2.0"));
         let third = sync(&conn, &zpath, &PricingTable::from_rows(vec![]), &overrides2, &[]).unwrap();
         assert_eq!(third.repriced, 2, "空定价表 + 有覆盖也必须重算");
         let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
@@ -552,8 +551,11 @@ mod tests {
         let mut overrides = HashMap::new();
         for m in ["m1", "m2", "m3"] {
             let p = ModelPricing { input: Decimal::from_str("1.0").unwrap(), ..pricing_zero() };
-            dao::set_override(&conn, "p1", m, &p).unwrap();
-            overrides.insert(("p1".to_string(), m.to_string()), p);
+            dao::set_override(&conn, "p1", m, &p, None).unwrap();
+            overrides.insert(
+                ("p1".to_string(), m.to_string()),
+                TieredPricing { off_peak: p, peak: None },
+            );
         }
         let first = sync(&conn, &zpath, &table, &overrides, &[]).unwrap();
         assert_eq!(first.imported, 3);
@@ -599,6 +601,19 @@ mod tests {
             input: Decimal::ZERO, output: Decimal::ZERO,
             cache_read: Decimal::ZERO, cache_creation: Decimal::ZERO,
         }
+    }
+
+    /// 未启用峰谷的平价覆盖（既有行为的测试载体）。
+    fn tier_flat(input: &str) -> TieredPricing {
+        TieredPricing {
+            off_peak: ModelPricing { input: Decimal::from_str(input).unwrap(), ..pricing_zero() },
+            peak: None,
+        }
+    }
+
+    fn cost_of(logs: &[crate::db::dao::RequestLogRow], id: &str) -> (Decimal, Option<String>) {
+        let r = logs.iter().find(|l| l.request_id == id).unwrap();
+        (Decimal::from_str(&r.total_cost_usd).unwrap(), r.price_tier.clone())
     }
 
     /// 文件未变化（含 -wal）→ 第二次 sync 短路：不重扫、不写游标。
@@ -847,7 +862,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             ("p1".to_string(), "deepseek-v4.1-flash".to_string()),
-            ModelPricing { input: Decimal::from_str("0.15").unwrap(), ..pricing_zero() },
+            tier_flat("0.15"),
         );
         let second = sync(&conn, &zpath, &empty, &overrides, &[]).unwrap();
         assert_eq!(second.repriced, 1, "覆盖重算必须按归一化口径命中命名空间记录");
@@ -857,6 +872,82 @@ mod tests {
         assert!(r.priced);
         // input=1000, cache=0 → 1000 * 0.15 / 1e6 = 0.00015
         assert_eq!(r.total_cost_usd, "0.00015", "金额必须按覆盖价计算");
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    // -- 峰谷定价（DeepSeek 峰谷覆盖）----------------------------------------
+
+    /// 峰谷覆盖：同一组合的两行按各自 started_at 判档计价（插入路径与覆盖重算
+    /// pass 均按档）；关闭峰谷后全部回落普通覆盖价且计费档标注消失。
+    ///
+    /// 测试日取 2026-10-12（周一，节假日表外的普通工作日），days_from_civil = 20738；
+    /// 任务文档原拟的 2026-10-05 落在国庆假期表内，判档必为 off_peak，不能作峰段样本。
+    #[test]
+    fn tiered_override_prices_by_started_at_and_reverts() {
+        const DAY: i64 = 86_400_000;
+        let peak_ts = 20_738 * DAY + 2 * 3_600_000;  // 北京 10:00 = UTC 02:00
+        let off_ts = 20_738 * DAY + 11 * 3_600_000;  // 北京 19:00 = UTC 11:00
+        assert!(crate::pricing::tier::is_peak(peak_ts), "测试前提：peak_ts 应判为峰档");
+        assert!(!crate::pricing::tier::is_peak(off_ts), "测试前提：off_ts 应判为谷档");
+
+        let dir = std::env::temp_dir().join(format!("zc-test-tier-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        {
+            let c = rusqlite::Connection::open(&zpath).unwrap();
+            c.execute_batch(&format!(
+                "INSERT INTO model_usage VALUES
+                 ('pk','p1','m1','completed',{peak_ts},0,0,1000,0,0,0,0,'s1','main_turn'),
+                 ('op','p1','m1','completed',{off_ts},0,0,1000,0,0,0,0,'s1','main_turn');",
+            )).unwrap();
+        }
+        // 时间戳自检：北京 2026-10-12 10:00 / 19:00（UTC 02:00 / 11:00）
+        assert_eq!(peak_ts, 1_791_770_400_000);
+        assert_eq!(off_ts, 1_791_802_800_000);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let empty = PricingTable::from_rows(vec![]);
+
+        // 覆盖：空闲档 input=0.15；高峰档 = ×2 → input=0.3（仅 input 非 0，便于断言）
+        let off = ModelPricing { input: Decimal::from_str("0.15").unwrap(), ..pricing_zero() };
+        let peak = ModelPricing { input: Decimal::from_str("0.3").unwrap(), ..pricing_zero() };
+        dao::set_override(&conn, "p1", "m1", &off, Some(&peak)).unwrap();
+        let overrides = dao::get_overrides(&conn).unwrap();
+
+        // 首次同步：新行插入即按档计价；覆盖重算 pass 同样按档（金额一致）
+        let first = sync(&conn, &zpath, &empty, &overrides, &[]).unwrap();
+        assert_eq!(first.imported, 2);
+        assert_eq!(first.repriced, 2, "覆盖重算 pass 应重算该组合 2 行");
+
+        let mut logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        crate::db::dao::annotate_price_tiers(&mut logs, &overrides);
+        // 谷段行：1000 * 0.15 / 1e6 = 0.00015；峰段行：1000 * 0.3 / 1e6 = 0.0003
+        let (c_pk, t_pk) = cost_of(&logs, "pk");
+        let (c_op, t_op) = cost_of(&logs, "op");
+        assert_eq!(c_pk, Decimal::from_str("0.0003").unwrap(), "峰段行必须按高峰价计");
+        assert_eq!(c_op, Decimal::from_str("0.00015").unwrap(), "谷段行必须按空闲价计");
+        assert_eq!(t_pk.as_deref(), Some("peak"));
+        assert_eq!(t_op.as_deref(), Some("off_peak"));
+
+        // 关闭峰谷（peak=None，普通覆盖价保留）→ sync 重算 → 全部回落空闲价，标注消失
+        dao::set_override(&conn, "p1", "m1", &off, None).unwrap();
+        let overrides = dao::get_overrides(&conn).unwrap();
+        assert!(overrides.get(&("p1".into(), "m1".into())).unwrap().peak.is_none());
+        let second = sync(&conn, &zpath, &empty, &overrides, &[]).unwrap();
+        assert_eq!(second.repriced, 2, "关闭峰谷后该组合 2 行都应重算");
+
+        let mut logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        crate::db::dao::annotate_price_tiers(&mut logs, &overrides);
+        let (c_pk, t_pk) = cost_of(&logs, "pk");
+        let (c_op, t_op) = cost_of(&logs, "op");
+        assert_eq!(c_pk, Decimal::from_str("0.00015").unwrap(), "峰段行回落空闲价");
+        assert_eq!(c_op, Decimal::from_str("0.00015").unwrap(), "谷段行保持空闲价");
+        assert_eq!(t_pk, None, "关闭峰谷后不得再标注");
+        assert_eq!(t_op, None, "关闭峰谷后不得再标注");
 
         let _ = std::fs::remove_file(&zpath);
     }

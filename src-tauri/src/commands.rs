@@ -90,7 +90,12 @@ pub fn get_summary(state: State<'_, Mutex<AppState>>, since: i64, until: i64, sc
 pub fn list_logs(state: State<'_, Mutex<AppState>>, since: i64, until: i64, scope: Option<ScopeFilter>, limit: i64) -> Result<Vec<dao::RequestLogRow>, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_logs(&conn, since, until, scope.as_ref(), limit).map_err(|e| e.to_string())
+    let mut rows = dao::query_logs(&conn, since, until, scope.as_ref(), limit).map_err(|e| e.to_string())?;
+    // 计费档标注：判档逻辑只在 pricing::tier 一处（前端只渲染）；标注口径与
+    // resolve 的覆盖匹配一致（override_lookup），仅覆盖启用峰谷且已定价的行有值。
+    let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
+    dao::annotate_price_tiers(&mut rows, &overrides);
+    Ok(rows)
 }
 
 #[tauri::command]
@@ -156,12 +161,19 @@ pub fn list_audit_logs(state: State<'_, Mutex<AppState>>, limit: i64) -> Result<
     dao::list_audit_logs(&conn, limit).map_err(|e| e.to_string())
 }
 
-/// 保存「供应商 + 模型」的单价覆盖，立即重算该组合的所有行，返回重算行数。
+/// 保存「供应商 + 模型」的单价覆盖（可选启用峰谷双档），立即重算该组合的
+/// 所有行，返回重算行数。
+///
+/// 峰谷四价（`peak_input` 等，Tauri v2 自动 camelCase 映射前端 `peakInput` 等）：
+/// 全部提供 → 启用峰谷并校验；全部缺省 → 关闭峰谷（普通覆盖价保留）；
+/// 部分提供 → 报错。
 #[tauri::command]
 pub fn set_price_override(
     state: State<'_, Mutex<AppState>>,
     provider_id: String, model_id: String,
     input: String, output: String, cache_read: String, cache_creation: String,
+    peak_input: Option<String>, peak_output: Option<String>,
+    peak_cache_read: Option<String>, peak_cache_creation: Option<String>,
 ) -> Result<u32, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
@@ -173,7 +185,19 @@ pub fn set_price_override(
     let p = crate::pricing::ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation)
         .map_err(|e| format!("单价解析失败: {e}"))?;
     crate::pricing::validate_non_negative(&p)?;
-    dao::set_override(&conn, provider_id, model_id, &p).map_err(|e| e.to_string())?;
+
+    // 峰谷（可选）：全填 = 启用并校验；全空 = 关闭；部分填 = 明确报错。
+    let peak = match (&peak_input, &peak_output, &peak_cache_read, &peak_cache_creation) {
+        (None, None, None, None) => None,
+        (Some(i), Some(o), Some(cr), Some(cc)) => {
+            let pk = crate::pricing::ModelPricing::from_strings(i, o, cr, cc)
+                .map_err(|e| format!("高峰时段单价解析失败: {e}"))?;
+            crate::pricing::validate_non_negative(&pk).map_err(|e| format!("高峰时段{e}"))?;
+            Some(pk)
+        }
+        _ => return Err("高峰时段单价填写不完整：四个单价需全部填写或全部留空".into()),
+    };
+    dao::set_override(&conn, provider_id, model_id, &p, peak.as_ref()).map_err(|e| e.to_string())?;
 
     // 保存后立即重算：重读覆盖与定价表再同步。
     let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;

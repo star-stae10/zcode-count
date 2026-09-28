@@ -2,7 +2,7 @@ import { RequestLogRow } from "../lib/api";
 import { formatCost, formatTime } from "../lib/format";
 import { ProviderNames, providerLabel } from "../lib/providerName";
 
-const COLS = ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "用时/首字", "状态", "来源"];
+const COLS = ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "计费档", "用时/首字", "状态", "来源"];
 
 export function RequestLogTable({ rows, names }: { rows: RequestLogRow[]; names: ProviderNames }) {
   return (
@@ -27,6 +27,10 @@ export function RequestLogTable({ rows, names }: { rows: RequestLogRow[]; names:
               </td>
               <td className="py-2 pr-4">{r.output_tokens.toLocaleString()}</td>
               <td className="py-2 pr-4 font-medium">{formatCost(r.total_cost_usd, r.priced)}</td>
+              {/* 计费档由后端判档（pricing/tier.rs），前端只渲染，不做任何时间判断。 */}
+              <td className="py-2 pr-4 text-gray-500">
+                {r.price_tier === "peak" ? "峰" : r.price_tier === "off_peak" ? "谷" : "—"}
+              </td>
               <td className="py-2 pr-4 whitespace-nowrap text-gray-500">
                 {r.duration_ms != null ? `${(r.duration_ms / 1000).toFixed(1)}s` : "—"}
                 {r.first_token_ms != null ? ` / ${(r.first_token_ms / 1000).toFixed(1)}s` : ""}

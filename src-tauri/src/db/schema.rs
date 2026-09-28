@@ -47,6 +47,11 @@ pub fn migrate(conn: &Connection) -> Result<(), AppError> {
           output_cost_per_million TEXT NOT NULL,
           cache_read_cost_per_million TEXT NOT NULL,
           cache_creation_cost_per_million TEXT NOT NULL,
+          -- 峰谷定价（DeepSeek 峰谷覆盖）：NULL = 未启用峰谷
+          peak_input_cost_per_million TEXT,
+          peak_output_cost_per_million TEXT,
+          peak_cache_read_cost_per_million TEXT,
+          peak_cache_creation_cost_per_million TEXT,
           PRIMARY KEY (provider_id, model_id)
         );
 
@@ -126,6 +131,10 @@ pub fn migrate(conn: &Connection) -> Result<(), AppError> {
                output_cost_per_million TEXT NOT NULL,
                cache_read_cost_per_million TEXT NOT NULL,
                cache_creation_cost_per_million TEXT NOT NULL,
+               peak_input_cost_per_million TEXT,
+               peak_output_cost_per_million TEXT,
+               peak_cache_read_cost_per_million TEXT,
+               peak_cache_creation_cost_per_million TEXT,
                PRIMARY KEY (provider_id, model_id)
              );
              INSERT INTO pricing_overrides (provider_id, model_id, input_cost_per_million, output_cost_per_million, cache_read_cost_per_million, cache_creation_cost_per_million)
@@ -137,6 +146,22 @@ pub fn migrate(conn: &Connection) -> Result<(), AppError> {
             let _ = conn.execute_batch("ROLLBACK;");
         }
         result?;
+    }
+
+    // 峰谷定价：pricing_overrides 幂等补 4 个 peak 单价列（NULL = 未启用峰谷）。
+    // 存量库升级用；新库与 legacy 重建的 CREATE TABLE 已含这些列。
+    for col in [
+        "peak_input_cost_per_million",
+        "peak_output_cost_per_million",
+        "peak_cache_read_cost_per_million",
+        "peak_cache_creation_cost_per_million",
+    ] {
+        if !column_exists(conn, "pricing_overrides", col)? {
+            conn.execute(
+                &format!("ALTER TABLE pricing_overrides ADD COLUMN {col} TEXT"),
+                [],
+            )?;
+        }
     }
 
     Ok(())
@@ -273,5 +298,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(new_i, "5", "UPSERT 应更新而非插入重复行");
+    }
+
+    /// 存量库升级：pricing_overrides 缺 peak 四列时幂等补列（新列允许 NULL）。
+    #[test]
+    fn migrate_adds_peak_columns_idempotently() {
+        // 模拟上一版库：pricing_overrides 无 peak 列
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE pricing_overrides (
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                input_cost_per_million TEXT NOT NULL,
+                output_cost_per_million TEXT NOT NULL,
+                cache_read_cost_per_million TEXT NOT NULL,
+                cache_creation_cost_per_million TEXT NOT NULL,
+                PRIMARY KEY (provider_id, model_id)
+            );",
+        ).unwrap();
+
+        // 首次迁移补列；二次迁移必须幂等（重复 ALTER 会因列已存在报错）
+        migrate(&c).unwrap();
+        migrate(&c).unwrap();
+
+        for col in [
+            "peak_input_cost_per_million",
+            "peak_output_cost_per_million",
+            "peak_cache_read_cost_per_million",
+            "peak_cache_creation_cost_per_million",
+        ] {
+            assert!(column_exists(&c, "pricing_overrides", col).unwrap(), "缺列 {col}");
+        }
+        // 幂等的直接证据：每个 peak 列恰好出现一次
+        let mut stmt = c.prepare("PRAGMA table_info(pricing_overrides)").unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(names.iter().filter(|n| **n == "peak_input_cost_per_million").count(), 1,
+                   "peak 列不得重复: {names:?}");
     }
 }

@@ -18,6 +18,7 @@ function row(over: Partial<RequestLogRow> = {}): RequestLogRow {
     status: "completed",
     started_at: Date.UTC(2026, 8, 23, 12, 34),
     query_source: "main_turn",
+    price_tier: null,
     ...over,
   };
 }
@@ -25,7 +26,7 @@ function row(over: Partial<RequestLogRow> = {}): RequestLogRow {
 describe("RequestLogTable", () => {
   it("renders all columns and row values including cache-read subline", () => {
     const html = renderToStaticMarkup(<RequestLogTable rows={[row()]} names={{}} />);
-    for (const c of ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "用时/首字", "状态", "来源"]) {
+    for (const c of ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "计费档", "用时/首字", "状态", "来源"]) {
       expect(html).toContain(c);
     }
     expect(html).toContain("anthropic");
@@ -60,6 +61,17 @@ describe("RequestLogTable", () => {
   it("shows dash when query_source is null", () => {
     const html = renderToStaticMarkup(<RequestLogTable rows={[row({ query_source: null })]} names={{}} />);
     expect(html).toContain("—");
+  });
+
+  it("renders billing tier column: 峰 for peak, 谷 for off_peak, — for null", () => {
+    // 判档在后端（pricing/tier.rs），前端只按 price_tier 渲染。
+    const peak = renderToStaticMarkup(<RequestLogTable rows={[row({ price_tier: "peak" })]} names={{}} />);
+    expect(peak).toContain(">峰</td>");
+    const offPeak = renderToStaticMarkup(<RequestLogTable rows={[row({ price_tier: "off_peak" })]} names={{}} />);
+    expect(offPeak).toContain(">谷</td>");
+    const none = renderToStaticMarkup(<RequestLogTable rows={[row()]} names={{}} />);
+    expect(none).toContain("计费档");
+    expect(none).toContain(">—</td>");
   });
 
   it("shows dash for unpriced cost and when timings are null", () => {
