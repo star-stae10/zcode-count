@@ -1,4 +1,5 @@
-use crate::db::{dao, OwnDb};
+use crate::db::dao::{self, ClearScope, ScopeFilter};
+use crate::db::OwnDb;
 use crate::pricing::{cc_switch_db_path, table::PricingTable};
 use crate::zcode::{sync::sync, zcode_db_path};
 use serde::Serialize;
@@ -15,6 +16,7 @@ pub struct SyncStatus {
     pub pricing_found: bool,
     pub imported: i64,
     pub skipped: i64,
+    pub tombstoned: i64,
     pub unpriced: i64,
     pub last_synced_at: i64,
     pub last_error: Option<String>,
@@ -33,6 +35,13 @@ fn load_pricing() -> (PricingTable, bool) {
     }
 }
 
+/// 审计日志的「操作人」：单机工具，取本机 Windows 用户名。
+fn current_actor() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".into())
+}
+
 #[tauri::command]
 pub fn sync_usage(state: State<'_, Mutex<AppState>>) -> Result<SyncStatus, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
@@ -47,6 +56,7 @@ pub fn sync_usage(state: State<'_, Mutex<AppState>>) -> Result<SyncStatus, Strin
         pricing_found,
         imported: report.imported,
         skipped: report.skipped,
+        tombstoned: report.tombstoned,
         unpriced: report.unpriced,
         last_synced_at: chrono::Utc::now().timestamp_millis(),
         last_error: None,
@@ -54,31 +64,72 @@ pub fn sync_usage(state: State<'_, Mutex<AppState>>) -> Result<SyncStatus, Strin
 }
 
 #[tauri::command]
-pub fn get_summary(state: State<'_, Mutex<AppState>>, since: i64, until: i64, provider: Option<String>) -> Result<dao::Summary, String> {
+pub fn get_summary(state: State<'_, Mutex<AppState>>, since: i64, until: i64, scope: Option<ScopeFilter>) -> Result<dao::Summary, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_summary(&conn, since, until, provider.as_deref()).map_err(|e| e.to_string())
+    dao::query_summary(&conn, since, until, scope.as_ref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn list_logs(state: State<'_, Mutex<AppState>>, since: i64, until: i64, provider: Option<String>, limit: i64) -> Result<Vec<dao::RequestLogRow>, String> {
+pub fn list_logs(state: State<'_, Mutex<AppState>>, since: i64, until: i64, scope: Option<ScopeFilter>, limit: i64) -> Result<Vec<dao::RequestLogRow>, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_logs(&conn, since, until, provider.as_deref(), limit).map_err(|e| e.to_string())
+    dao::query_logs(&conn, since, until, scope.as_ref(), limit).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_provider_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64, provider: Option<String>) -> Result<Vec<dao::ProviderStat>, String> {
+pub fn get_provider_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64, scope: Option<ScopeFilter>) -> Result<Vec<dao::ProviderStat>, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_provider_stats(&conn, since, until, provider.as_deref()).map_err(|e| e.to_string())
+    dao::query_provider_stats(&conn, since, until, scope.as_ref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_model_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64, provider: Option<String>) -> Result<Vec<dao::ModelStat>, String> {
+pub fn get_model_stats(state: State<'_, Mutex<AppState>>, since: i64, until: i64, scope: Option<ScopeFilter>) -> Result<Vec<dao::ModelStat>, String> {
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
-    dao::query_model_stats(&conn, since, until, provider.as_deref()).map_err(|e| e.to_string())
+    dao::query_model_stats(&conn, since, until, scope.as_ref()).map_err(|e| e.to_string())
+}
+
+/// 库中出现过的全部 (供应商, 模型) 组合（层级选择器的数据源）。
+#[tauri::command]
+pub fn list_provider_models(state: State<'_, Mutex<AppState>>) -> Result<Vec<dao::ProviderModelRow>, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::list_provider_models(&conn).map_err(|e| e.to_string())
+}
+
+/// 未定价模型清单（含粗略成本估算区间）。
+#[tauri::command]
+pub fn get_unpriced_models(state: State<'_, Mutex<AppState>>, since: i64, until: i64, scope: Option<ScopeFilter>) -> Result<Vec<dao::UnpricedModelRow>, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::query_unpriced_models(&conn, since, until, scope.as_ref()).map_err(|e| e.to_string())
+}
+
+/// 预览清除范围（不删除）：返回将删除的条数与授权确认短语。
+/// 边界问题（时间倒置 / 供应商不存在 / 模型不属于 / 无数据）在此明确报错。
+#[tauri::command]
+pub fn preview_clear_usage(state: State<'_, Mutex<AppState>>, scope: ClearScope) -> Result<dao::ClearPreview, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::preview_clear(&conn, &scope).map_err(|e| e.to_string())
+}
+
+/// 执行清除（危险操作）：后端强制校验授权确认短语；成功后记录审计日志并写清除墓碑。
+#[tauri::command]
+pub fn clear_usage(state: State<'_, Mutex<AppState>>, scope: ClearScope, confirm: String) -> Result<dao::ClearResult, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let mut conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::clear_records(&mut conn, &scope, &confirm, &current_actor()).map_err(|e| e.to_string())
+}
+
+/// 审计日志（清除类操作的历史记录）。
+#[tauri::command]
+pub fn list_audit_logs(state: State<'_, Mutex<AppState>>, limit: i64) -> Result<Vec<dao::AuditLogRow>, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::list_audit_logs(&conn, limit).map_err(|e| e.to_string())
 }
 
 /// 保存「供应商 + 模型」的单价覆盖，立即重算该组合的所有行，返回重算行数。

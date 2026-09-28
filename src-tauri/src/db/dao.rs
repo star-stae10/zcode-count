@@ -1,9 +1,10 @@
 use crate::error::AppError;
 use crate::pricing::ModelPricing;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use rust_decimal::Decimal;
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +50,86 @@ pub struct Summary {
     pub session_count: i64,
     pub total_cost_usd: String,
     pub unpriced_count: i64,
+    /// 未定价行的 token 总量（input+output），用于成本可信度提示。
+    pub unpriced_tokens: i64,
+    /// 未定价的 (provider, model) 组合数。
+    pub unpriced_models: i64,
+}
+
+/// 「供应商 + 模型」组合（用于核算范围筛选与清除范围的模型级选择）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ModelSel {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// 核算范围筛选（供应商级 + 模型级并集生效；两者都空 = 不筛选）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ScopeFilter {
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub models: Vec<ModelSel>,
+}
+
+impl ScopeFilter {
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty() && self.models.is_empty()
+    }
+}
+
+/// 生成供应商/模型范围的 WHERE 片段（以 `AND (...)` 开头，无筛选时为空串）。
+/// 占位符编号从 `start`（1-based）开始连续分配，与返回的参数一一对应。
+///
+/// 语义：`provider_id IN (选中的供应商) OR (provider_id = ? AND model_id = ?)`，
+/// 即供应商级与模型级选择取并集。
+fn scope_condition(scope: &ScopeFilter, start: usize) -> (String, Vec<Value>) {
+    if scope.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    let mut idx = start;
+    if !scope.providers.is_empty() {
+        let holders: Vec<String> = scope
+            .providers
+            .iter()
+            .map(|p| {
+                let s = format!("?{idx}");
+                idx += 1;
+                values.push(Value::from(p.clone()));
+                s
+            })
+            .collect();
+        parts.push(format!("provider_id IN ({})", holders.join(",")));
+    }
+    for m in &scope.models {
+        parts.push(format!(
+            "(provider_id = ?{idx} AND model_id = ?{})",
+            idx + 1
+        ));
+        values.push(Value::from(m.provider_id.clone()));
+        values.push(Value::from(m.model_id.clone()));
+        idx += 2;
+    }
+    (format!(" AND ({})", parts.join(" OR ")), values)
+}
+
+/// 生成时间范围片段（闭区间），占位符编号从 `start` 开始；无限制时为空串。
+fn time_condition(since: Option<i64>, until: Option<i64>, start: usize) -> (String, Vec<Value>) {
+    let mut sql = String::new();
+    let mut values = Vec::new();
+    let mut idx = start;
+    if since.is_some() {
+        sql.push_str(&format!(" AND started_at >= ?{idx}"));
+        values.push(Value::from(since.unwrap()));
+        idx += 1;
+    }
+    if until.is_some() {
+        sql.push_str(&format!(" AND started_at <= ?{idx}"));
+        values.push(Value::from(until.unwrap()));
+    }
+    (sql, values)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,27 +296,33 @@ pub fn set_cursor(conn: &Connection, source: &str, last_started_at: i64, last_mt
     Ok(())
 }
 
-pub fn query_summary(conn: &Connection, since: i64, until: i64, provider: Option<&str>) -> Result<Summary, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
-                cache_creation_tokens, session_id, total_cost_usd, priced
-         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2
-           AND (?3 IS NULL OR provider_id = ?3)",
-    )?;
-    let it = stmt.query_map(params![since, until, provider], |row| {
+pub fn query_summary(conn: &Connection, since: i64, until: i64, scope: Option<&ScopeFilter>) -> Result<Summary, AppError> {
+    let empty = ScopeFilter::default();
+    let scope = scope.unwrap_or(&empty);
+    let (scope_sql, mut values) = scope_condition(scope, 3);
+    values.insert(0, Value::from(until));
+    values.insert(0, Value::from(since));
+    let mut stmt = conn.prepare(&format!(
+        "SELECT provider_id, model_id, input_tokens, output_tokens, reasoning_tokens,
+                cache_read_tokens, cache_creation_tokens, session_id, total_cost_usd, priced
+         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2{scope_sql}"
+    ))?;
+    let it = stmt.query_map(params_from_iter(values.iter()), |row| {
         Ok((
-            row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
-            row.get::<_, Option<String>>(5)?, row.get::<_, String>(6)?,
-            row.get::<_, i64>(7)?,
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?, row.get::<_, i64>(6)?,
+            row.get::<_, Option<String>>(7)?, row.get::<_, String>(8)?,
+            row.get::<_, i64>(9)?,
         ))
     })?;
 
     let mut s = Summary::default();
     let mut total = Decimal::ZERO;
-    let mut sessions = std::collections::HashSet::new();
+    let mut sessions = HashSet::new();
+    let mut unpriced_models: HashSet<(String, String)> = HashSet::new();
     for r in it {
-        let (i, o, re, cr, cc, sess, cost, priced) = r?;
+        let (p, m, i, o, re, cr, cc, sess, cost, priced) = r?;
         s.input_tokens += i;
         s.output_tokens += o;
         s.reasoning_tokens += re;
@@ -243,29 +330,34 @@ pub fn query_summary(conn: &Connection, since: i64, until: i64, provider: Option
         s.cache_creation_tokens += cc;
         s.request_count += 1;
         if let Some(x) = sess { sessions.insert(x); }
-        if priced == 0 { s.unpriced_count += 1; }
+        if priced == 0 {
+            s.unpriced_count += 1;
+            s.unpriced_tokens += i + o;
+            unpriced_models.insert((p, m));
+        }
         total += Decimal::from_str(&cost).unwrap_or(Decimal::ZERO);
     }
     s.session_count = sessions.len() as i64;
+    s.unpriced_models = unpriced_models.len() as i64;
     s.total_cost_usd = total.normalize().to_string();
     Ok(s)
 }
 
-pub fn query_logs(conn: &Connection, since: i64, until: i64, provider: Option<&str>, limit: i64) -> Result<Vec<RequestLogRow>, AppError> {
-    let mut sql = String::from(
+pub fn query_logs(conn: &Connection, since: i64, until: i64, scope: Option<&ScopeFilter>, limit: i64) -> Result<Vec<RequestLogRow>, AppError> {
+    let empty = ScopeFilter::default();
+    let scope = scope.unwrap_or(&empty);
+    let (scope_sql, mut values) = scope_condition(scope, 3);
+    values.insert(0, Value::from(until));
+    values.insert(0, Value::from(since));
+    let sql = format!(
         "SELECT request_id, provider_id, model_id, input_tokens, output_tokens,
                 cache_read_tokens, total_cost_usd, priced, duration_ms, first_token_ms,
                 status, started_at, query_source
-         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2",
+         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2{scope_sql}
+         ORDER BY started_at DESC LIMIT {limit}"
     );
-    if provider.is_some() {
-        sql.push_str(" AND provider_id = ?3");
-    }
-    sql.push_str(" ORDER BY started_at DESC LIMIT ?");
-    let limit_idx = if provider.is_some() { 4 } else { 3 };
-    sql.push_str(&limit_idx.to_string());
-
-    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<RequestLogRow> {
+    let mut stmt = conn.prepare(&sql)?;
+    let it = stmt.query_map(params_from_iter(values.iter()), |row| {
         Ok(RequestLogRow {
             request_id: row.get(0)?,
             provider_id: row.get(1)?,
@@ -281,29 +373,24 @@ pub fn query_logs(conn: &Connection, since: i64, until: i64, provider: Option<&s
             started_at: row.get(11)?,
             query_source: row.get(12)?,
         })
-    };
-
+    })?;
     let mut rows = Vec::new();
-    if let Some(p) = provider {
-        let mut stmt = conn.prepare(&sql)?;
-        let it = stmt.query_map(params![since, until, p, limit], map_row)?;
-        for r in it { rows.push(r?); }
-    } else {
-        let mut stmt = conn.prepare(&sql)?;
-        let it = stmt.query_map(params![since, until, limit], map_row)?;
-        for r in it { rows.push(r?); }
-    }
+    for r in it { rows.push(r?); }
     Ok(rows)
 }
 
-fn group_stats(conn: &Connection, key: &str, since: i64, until: i64, provider: Option<&str>) -> Result<Vec<(String, i64, i64, i64, String, i64)>, AppError> {
+fn group_stats(conn: &Connection, key: &str, since: i64, until: i64, scope: Option<&ScopeFilter>) -> Result<Vec<(String, i64, i64, i64, String, i64)>, AppError> {
+    let empty = ScopeFilter::default();
+    let scope = scope.unwrap_or(&empty);
+    let (scope_sql, mut values) = scope_condition(scope, 3);
+    values.insert(0, Value::from(until));
+    values.insert(0, Value::from(since));
     let sql = format!(
         "SELECT {key}, input_tokens, output_tokens, total_cost_usd, priced
-         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2
-           AND (?3 IS NULL OR provider_id = ?3)"
+         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2{scope_sql}"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let it = stmt.query_map(params![since, until, provider], |row| {
+    let it = stmt.query_map(params_from_iter(values.iter()), |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -338,8 +425,8 @@ fn group_stats(conn: &Connection, key: &str, since: i64, until: i64, provider: O
     Ok(out)
 }
 
-pub fn query_provider_stats(conn: &Connection, since: i64, until: i64, provider: Option<&str>) -> Result<Vec<ProviderStat>, AppError> {
-    Ok(group_stats(conn, "provider_id", since, until, provider)?
+pub fn query_provider_stats(conn: &Connection, since: i64, until: i64, scope: Option<&ScopeFilter>) -> Result<Vec<ProviderStat>, AppError> {
+    Ok(group_stats(conn, "provider_id", since, until, scope)?
         .into_iter()
         .map(|(id, c, i, o, cost, unpriced)| ProviderStat {
             provider_id: id,
@@ -352,8 +439,8 @@ pub fn query_provider_stats(conn: &Connection, since: i64, until: i64, provider:
         .collect())
 }
 
-pub fn query_model_stats(conn: &Connection, since: i64, until: i64, provider: Option<&str>) -> Result<Vec<ModelStat>, AppError> {
-    Ok(group_stats(conn, "model_id", since, until, provider)?
+pub fn query_model_stats(conn: &Connection, since: i64, until: i64, scope: Option<&ScopeFilter>) -> Result<Vec<ModelStat>, AppError> {
+    Ok(group_stats(conn, "model_id", since, until, scope)?
         .into_iter()
         .map(|(id, c, i, o, cost, unpriced)| ModelStat {
             model_id: id,
@@ -467,6 +554,458 @@ pub fn clear_pricing_by_provider_model(
     Ok(n)
 }
 
+// ---------------------------------------------------------------------------
+// 供应商 > 模型层级（范围选择与清除弹窗共用）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderModelRow {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+/// 库中出现过的全部 (provider, model) 组合，按供应商、模型排序。
+pub fn list_provider_models(conn: &Connection) -> Result<Vec<ProviderModelRow>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT provider_id, model_id FROM usage_records ORDER BY provider_id, model_id",
+    )?;
+    let it = stmt.query_map([], |row| {
+        Ok(ProviderModelRow {
+            provider_id: row.get(0)?,
+            model_id: row.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 未定价模型清单（成本可信度警告的明细）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnpricedModelRow {
+    pub provider_id: String,
+    pub model_id: String,
+    pub request_count: i64,
+    /// input + output（与成本同口径的 token 总量）。
+    pub total_tokens: i64,
+    pub first_started_at: i64,
+    pub last_started_at: i64,
+    /// 估算成本区间（USD 字符串）：按同供应商已定价模型的每 token 单价范围推算；
+    /// 该供应商无可参照的已定价行时为 None（前端显示「无法估算」）。
+    pub est_cost_low_usd: Option<String>,
+    pub est_cost_high_usd: Option<String>,
+}
+
+/// 未定价 (provider, model) 分组明细 + 粗略成本估算区间。
+///
+/// 估算口径：单价 = total_cost / (input+output)，取同供应商已定价行的
+/// [最低, 最高] 单价 × 该组合未定价 token 量。仅供参考，非精确计算。
+pub fn query_unpriced_models(conn: &Connection, since: i64, until: i64, scope: Option<&ScopeFilter>) -> Result<Vec<UnpricedModelRow>, AppError> {
+    let empty = ScopeFilter::default();
+    let scope = scope.unwrap_or(&empty);
+    let (scope_sql, mut values) = scope_condition(scope, 3);
+    values.insert(0, Value::from(until));
+    values.insert(0, Value::from(since));
+    let mut stmt = conn.prepare(&format!(
+        "SELECT provider_id, model_id, priced, input_tokens, output_tokens,
+                total_cost_usd, started_at
+         FROM usage_records WHERE started_at >= ?1 AND started_at <= ?2{scope_sql}"
+    ))?;
+    let it = stmt.query_map(params_from_iter(values.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?, row.get::<_, i64>(6)?,
+        ))
+    })?;
+
+    struct Agg { count: i64, tokens: i64, first: i64, last: i64 }
+    let mut unpriced: HashMap<(String, String), Agg> = HashMap::new();
+    // 每供应商已定价行的每 token 单价范围（cost / (input+output)）
+    let mut unit_range: HashMap<String, (Decimal, Decimal)> = HashMap::new();
+    for r in it {
+        let (p, m, priced, i, o, cost, started) = r?;
+        let tokens = i + o;
+        if priced == 0 {
+            let e = unpriced.entry((p, m)).or_insert(Agg { count: 0, tokens: 0, first: started, last: started });
+            e.count += 1;
+            e.tokens += tokens;
+            e.first = e.first.min(started);
+            e.last = e.last.max(started);
+        } else if tokens > 0 {
+            let unit = Decimal::from_str(&cost).unwrap_or(Decimal::ZERO) / Decimal::from(tokens);
+            let e = unit_range.entry(p).or_insert((unit, unit));
+            e.0 = e.0.min(unit);
+            e.1 = e.1.max(unit);
+        }
+    }
+
+    let mut out: Vec<UnpricedModelRow> = unpriced
+        .into_iter()
+        .map(|((p, m), a)| {
+            let est: Option<(Decimal, Decimal)> =
+                unit_range.get(&p).copied().map(|(min, max)| {
+                    (Decimal::from(a.tokens) * min, Decimal::from(a.tokens) * max)
+                });
+            UnpricedModelRow {
+                provider_id: p,
+                model_id: m,
+                request_count: a.count,
+                total_tokens: a.tokens,
+                first_started_at: a.first,
+                last_started_at: a.last,
+                est_cost_low_usd: est.map(|(l, _)| l.normalize().to_string()),
+                est_cost_high_usd: est.map(|(_, h)| h.normalize().to_string()),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.provider_id.cmp(&b.provider_id).then(a.model_id.cmp(&b.model_id)));
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 清除用量数据（危险操作：删除 + 审计 + 墓碑）
+// ---------------------------------------------------------------------------
+
+/// 清除范围（时间段 + 供应商/模型并集）。全空 = 清除全部。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClearScope {
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub models: Vec<ModelSel>,
+}
+
+impl ClearScope {
+    /// 是否为「无任何条件」的全清。
+    fn is_full_clear(&self) -> bool {
+        self.since.is_none() && self.until.is_none()
+            && self.providers.is_empty() && self.models.is_empty()
+    }
+}
+
+/// 清除前预览：将删除的条数与授权确认短语。
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearPreview {
+    pub deleted_count: i64,
+    pub confirm_token: String,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub providers: Vec<String>,
+    pub models: Vec<ModelSel>,
+}
+
+/// 清除结果反馈。
+#[derive(Debug, Clone, Serialize)]
+pub struct ClearResult {
+    pub deleted_count: i64,
+    pub affected_since: Option<i64>,
+    pub affected_until: Option<i64>,
+    pub affected_providers: Vec<String>,
+    pub affected_models: Vec<ModelSel>,
+    pub audit_id: i64,
+    /// 是否为全清（连带重置了同步游标）。
+    pub cursor_reset: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditLogRow {
+    pub id: i64,
+    pub actor: String,
+    pub action: String,
+    pub started_at_from: Option<i64>,
+    pub started_at_to: Option<i64>,
+    pub providers: Vec<String>,
+    pub models: Vec<ModelSel>,
+    pub deleted_count: i64,
+    pub created_at: i64,
+}
+
+/// 同步回灌过滤用的清除墓碑（闭区间 [ts_from, ts_to]）。
+#[derive(Debug, Clone)]
+pub struct Tombstone {
+    pub ts_from: i64,
+    pub ts_to: i64,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+}
+
+/// 授权确认短语：`删除N`（N 为预览到的删除条数）。执行时后端强制校验，
+/// 预览后数据变化（条数不符）会自然校验失败，防止误删。
+pub fn confirm_token(count: i64) -> String {
+    format!("删除{count}")
+}
+
+struct ClearTargets {
+    count: i64,
+    min_started: Option<i64>,
+    max_started: Option<i64>,
+    providers: Vec<String>,
+    models: Vec<ModelSel>,
+}
+
+/// 清除条件的完整 WHERE 片段（时间 + 范围，均可选），占位符从 `start` 编号。
+fn clear_condition(scope: &ClearScope, start: usize) -> (String, Vec<Value>) {
+    let (t_sql, mut values) = time_condition(scope.since, scope.until, start);
+    let next = start + values.len();
+    let (s_sql, s_values) = {
+        let f = ScopeFilter {
+            providers: scope.providers.clone(),
+            models: scope.models.clone(),
+        };
+        scope_condition(&f, next)
+    };
+    values.extend(s_values);
+    (format!("{t_sql}{s_sql}"), values)
+}
+
+/// 校验清除范围的边界：时间倒置、供应商不存在、模型不存在/不属于所选供应商。
+pub fn validate_clear_scope(conn: &Connection, scope: &ClearScope) -> Result<(), AppError> {
+    if let (Some(s), Some(u)) = (scope.since, scope.until) {
+        if s > u {
+            return Err(AppError::Config(format!(
+                "开始时间（{}）晚于结束时间（{}），请修正时间范围",
+                chrono::DateTime::from_timestamp_millis(s).map(|d| d.to_string()).unwrap_or_else(|| s.to_string()),
+                chrono::DateTime::from_timestamp_millis(u).map(|d| d.to_string()).unwrap_or_else(|| u.to_string()),
+            )));
+        }
+    }
+    if scope.providers.is_empty() && scope.models.is_empty() {
+        return Ok(()); // 全清或仅按时间清除，无供应商/模型可校验
+    }
+    let known_providers: HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT provider_id FROM usage_records")?;
+        let it = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut set = HashSet::new();
+        for r in it { set.insert(r?); }
+        set
+    };
+    for p in &scope.providers {
+        if !known_providers.contains(p) {
+            return Err(AppError::Config(format!("供应商「{p}」不存在（数据库中没有该供应商的用量记录）")));
+        }
+    }
+    let known_models: HashSet<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT provider_id, model_id FROM usage_records")?;
+        let it = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut set = HashSet::new();
+        for r in it { set.insert(r?); }
+        set
+    };
+    for m in &scope.models {
+        let key = (m.provider_id.clone(), m.model_id.clone());
+        if !known_models.contains(&key) {
+            let belongs_elsewhere = known_models.iter().any(|(_, mm)| mm == &m.model_id);
+            return Err(AppError::Config(if belongs_elsewhere {
+                format!("模型「{}」不属于供应商「{}」（或该组合无数据），请检查选择", m.model_id, m.provider_id)
+            } else {
+                format!("模型「{}」不存在（数据库中没有该模型的用量记录）", m.model_id)
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// 计算将被清除的目标集合（条数、时间边界、供应商、模型）。
+/// 目标为空时返回明确错误，杜绝「静默的成功」。
+fn clear_targets(conn: &Connection, scope: &ClearScope) -> Result<ClearTargets, AppError> {
+    let (cond, values) = clear_condition(scope, 1);
+    let (count, min_started, max_started): (i64, Option<i64>, Option<i64>) = conn.query_row(
+        &format!(
+            "SELECT COUNT(*), MIN(started_at), MAX(started_at) FROM usage_records WHERE 1=1{cond}"
+        ),
+        params_from_iter(values.iter()),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if count == 0 {
+        return Err(AppError::Config("所选范围内没有数据，无需清除".into()));
+    }
+    let providers: Vec<String> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT provider_id FROM usage_records WHERE 1=1{cond} ORDER BY provider_id"
+        ))?;
+        let it = stmt.query_map(params_from_iter(values.iter()), |r| r.get::<_, String>(0))?;
+        let mut v = Vec::new();
+        for r in it { v.push(r?); }
+        v
+    };
+    let models: Vec<ModelSel> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT DISTINCT provider_id, model_id FROM usage_records WHERE 1=1{cond} ORDER BY provider_id, model_id"
+        ))?;
+        let it = stmt.query_map(params_from_iter(values.iter()), |r| {
+            Ok(ModelSel { provider_id: r.get(0)?, model_id: r.get(1)? })
+        })?;
+        let mut v = Vec::new();
+        for r in it { v.push(r?); }
+        v
+    };
+    Ok(ClearTargets { count, min_started, max_started, providers, models })
+}
+
+/// 预览清除范围（不删除）。返回条数与授权确认短语。
+pub fn preview_clear(conn: &Connection, scope: &ClearScope) -> Result<ClearPreview, AppError> {
+    validate_clear_scope(conn, scope)?;
+    let t = clear_targets(conn, scope)?;
+    Ok(ClearPreview {
+        deleted_count: t.count,
+        confirm_token: confirm_token(t.count),
+        since: scope.since,
+        until: scope.until,
+        providers: t.providers,
+        models: t.models,
+    })
+}
+
+/// 执行清除：校验 → 事务内（计数 → 授权校验 → 删除 → 写墓碑 → 全清重置游标 → 审计）。
+///
+/// 墓碑记录被删范围，供 sync 过滤 ZCode 源库回灌的行（重叠窗口会把
+/// `started_at` 早于水位线的行再次导入；源库只读，删除只发生在自有库）。
+pub fn clear_records(conn: &mut Connection, scope: &ClearScope, confirm: &str, actor: &str) -> Result<ClearResult, AppError> {
+    validate_clear_scope(conn, scope)?;
+    let tx = conn.transaction()?;
+    let t = clear_targets(&tx, scope)?;
+
+    let expected = confirm_token(t.count);
+    if confirm.trim() != expected {
+        return Err(AppError::Config(format!(
+            "授权确认不通过：请输入「{expected}」以确认。若预览后数据已变化，请重新预览"
+        )));
+    }
+
+    let (cond, values) = clear_condition(scope, 1);
+    let deleted = tx.execute(
+        &format!("DELETE FROM usage_records WHERE 1=1{cond}"),
+        params_from_iter(values.iter()),
+    )?;
+
+    // 写墓碑：时间边界缺省为 [0, now]（不限过去时间 = 挡住清除时刻前的全部相关行）。
+    let now = chrono::Utc::now().timestamp_millis();
+    let (ts_from, ts_to) = match (scope.since, scope.until) {
+        (Some(s), Some(u)) => (s, u),
+        (Some(s), None) => (s, now),
+        (None, Some(u)) => (0, u),
+        (None, None) => (0, now),
+    };
+    let mut tomb_rows: Vec<(i64, i64, Option<String>, Option<String>)> = Vec::new();
+    if scope.providers.is_empty() && scope.models.is_empty() {
+        tomb_rows.push((ts_from, ts_to, None, None));
+    } else {
+        for p in &scope.providers {
+            tomb_rows.push((ts_from, ts_to, Some(p.clone()), None));
+        }
+        for m in &scope.models {
+            tomb_rows.push((ts_from, ts_to, Some(m.provider_id.clone()), Some(m.model_id.clone())));
+        }
+    }
+    for (f, to, p, m) in &tomb_rows {
+        tx.execute(
+            "INSERT INTO clear_tombstones (ts_from, ts_to, provider_id, model_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![f, to, p, m, now],
+        )?;
+    }
+
+    // 全清（无任何条件）时重置同步游标：下次 sync 从头扫描（结果被墓碑全部过滤），
+    // 游标不再指向已删除的数据。
+    let cursor_reset = scope.is_full_clear();
+    if cursor_reset {
+        tx.execute("DELETE FROM sync_cursors", [])?;
+    }
+
+    let audit_id = insert_audit_log(
+        &tx, actor, "clear_usage", scope.since, scope.until,
+        &scope.providers, &scope.models, deleted as i64,
+    )?;
+    tx.commit()?;
+
+    Ok(ClearResult {
+        deleted_count: deleted as i64,
+        affected_since: t.min_started,
+        affected_until: t.max_started,
+        affected_providers: t.providers,
+        affected_models: t.models,
+        audit_id,
+        cursor_reset,
+    })
+}
+
+pub fn insert_audit_log(
+    conn: &Connection, actor: &str, action: &str,
+    since: Option<i64>, until: Option<i64>,
+    providers: &[String], models: &[ModelSel], deleted_count: i64,
+) -> Result<i64, AppError> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut stmt = conn.prepare(
+        "INSERT INTO audit_log (actor, action, started_at_from, started_at_to, providers, models, deleted_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    stmt.execute(params![
+        actor, action, since, until,
+        serde_json::to_string(providers).unwrap_or_else(|_| "[]".into()),
+        serde_json::to_string(models).unwrap_or_else(|_| "[]".into()),
+        deleted_count, now,
+    ])?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_audit_logs(conn: &Connection, limit: i64) -> Result<Vec<AuditLogRow>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, actor, action, started_at_from, started_at_to, providers, models, deleted_count, created_at
+         FROM audit_log ORDER BY id DESC LIMIT ?1",
+    )?;
+    let it = stmt.query_map(params![limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?, row.get::<_, Option<i64>>(4)?,
+            row.get::<_, String>(5)?, row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?, row.get::<_, i64>(8)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in it {
+        let (id, actor, action, from, to, providers_json, models_json, deleted_count, created_at) = r?;
+        let providers: Vec<String> = serde_json::from_str(&providers_json)
+            .map_err(|e| AppError::Database(format!("审计日志 providers 字段损坏: {e}")))?;
+        let models: Vec<ModelSel> = serde_json::from_str(&models_json)
+            .map_err(|e| AppError::Database(format!("审计日志 models 字段损坏: {e}")))?;
+        out.push(AuditLogRow { id, actor, action, started_at_from: from, started_at_to: to, providers, models, deleted_count, created_at });
+    }
+    Ok(out)
+}
+
+pub fn list_tombstones(conn: &Connection) -> Result<Vec<Tombstone>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT ts_from, ts_to, provider_id, model_id FROM clear_tombstones",
+    )?;
+    let it = stmt.query_map([], |row| {
+        Ok(Tombstone {
+            ts_from: row.get(0)?,
+            ts_to: row.get(1)?,
+            provider_id: row.get(2)?,
+            model_id: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
+}
+
+/// 行是否命中任一墓碑（命中 = 已被用户清除，同步时必须跳过）。
+pub fn is_tombstoned(started_at: i64, provider_id: &str, model_id: &str, tombs: &[Tombstone]) -> bool {
+    tombs.iter().any(|t| {
+        started_at >= t.ts_from
+            && started_at <= t.ts_to
+            && t.provider_id.as_deref().map_or(true, |p| p == provider_id)
+            && t.model_id.as_deref().map_or(true, |m| m == model_id)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,29 +1097,87 @@ mod tests {
     }
 
     #[test]
-    fn summary_and_stats_filter_by_provider() {
+    fn summary_and_stats_filter_by_scope() {
         let c = conn();
         let mut b = rec("b", "m2", 20);
         b.provider_id = "p2".into();
         insert_record(&c, &rec("a", "m1", 10)).unwrap();
         insert_record(&c, &b).unwrap();
 
-        // summary：筛选只含 p2 的行，None 为全量
-        let s = query_summary(&c, 0, 100, Some("p2")).unwrap();
+        // 供应商级筛选：只含 p2
+        let scope_p2 = ScopeFilter { providers: vec!["p2".into()], models: vec![] };
+        let s = query_summary(&c, 0, 100, Some(&scope_p2)).unwrap();
         assert_eq!(s.request_count, 1);
         assert_eq!(s.input_tokens, 1000);
         assert_eq!(query_summary(&c, 0, 100, None).unwrap().request_count, 2);
-        assert_eq!(query_summary(&c, 0, 100, Some("nope")).unwrap().request_count, 0);
+        let nope = ScopeFilter { providers: vec!["nope".into()], models: vec![] };
+        assert_eq!(query_summary(&c, 0, 100, Some(&nope)).unwrap().request_count, 0);
 
-        let providers = query_provider_stats(&c, 0, 100, Some("p2")).unwrap();
+        let providers = query_provider_stats(&c, 0, 100, Some(&scope_p2)).unwrap();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].provider_id, "p2");
-        assert!(query_provider_stats(&c, 0, 100, Some("nope")).unwrap().is_empty());
+        assert!(query_provider_stats(&c, 0, 100, Some(&nope)).unwrap().is_empty());
 
-        let models = query_model_stats(&c, 0, 100, Some("p2")).unwrap();
+        let models = query_model_stats(&c, 0, 100, Some(&scope_p2)).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model_id, "m2");
-        assert!(query_model_stats(&c, 0, 100, Some("nope")).unwrap().is_empty());
+        assert!(query_model_stats(&c, 0, 100, Some(&nope)).unwrap().is_empty());
+    }
+
+    /// 范围筛选支持多供应商 + 跨供应商多选模型，且并集生效。
+    #[test]
+    fn scope_filter_supports_multi_providers_and_cross_provider_models() {
+        let c = conn();
+        for (id, p, m) in [("a", "p1", "m1"), ("b", "p1", "m2"), ("c", "p2", "m3"), ("d", "p3", "m4")] {
+            let mut r = rec(id, m, 10);
+            r.provider_id = p.into();
+            insert_record(&c, &r).unwrap();
+        }
+        // 供应商 p1（全部）+ (p2, m3) 单模型 → a/b/c
+        let scope = ScopeFilter {
+            providers: vec!["p1".into()],
+            models: vec![ModelSel { provider_id: "p2".into(), model_id: "m3".into() }],
+        };
+        let s = query_summary(&c, 0, 100, Some(&scope)).unwrap();
+        assert_eq!(s.request_count, 3);
+
+        // 跨供应商多选模型：(p1,m2) + (p3,m4) → b/d
+        let scope2 = ScopeFilter {
+            providers: vec![],
+            models: vec![
+                ModelSel { provider_id: "p1".into(), model_id: "m2".into() },
+                ModelSel { provider_id: "p3".into(), model_id: "m4".into() },
+            ],
+        };
+        let logs = query_logs(&c, 0, 100, Some(&scope2), 100).unwrap();
+        let mut ids: Vec<&str> = logs.iter().map(|l| l.request_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["b", "d"]);
+
+        // 供应商级与模型级重叠时不重复计数（并集语义）
+        let scope3 = ScopeFilter {
+            providers: vec!["p1".into()],
+            models: vec![ModelSel { provider_id: "p1".into(), model_id: "m1".into() }],
+        };
+        assert_eq!(query_summary(&c, 0, 100, Some(&scope3)).unwrap().request_count, 2);
+    }
+
+    #[test]
+    fn summary_counts_unpriced_tokens_and_models() {
+        let c = conn();
+        insert_record(&c, &rec("a", "m1", 10)).unwrap();
+        let mut u1 = rec("b", "m1", 20);
+        u1.priced = false;
+        let mut u2 = rec("c", "m2", 30);
+        u2.priced = false;
+        u2.provider_id = "p2".into();
+        insert_record(&c, &u1).unwrap();
+        insert_record(&c, &u2).unwrap();
+
+        let s = query_summary(&c, 0, 100, None).unwrap();
+        assert_eq!(s.unpriced_count, 2);
+        assert_eq!(s.unpriced_tokens, (1000 + 500) * 2);
+        assert_eq!(s.unpriced_models, 2, "两个 (provider, model) 组合未定价");
     }
 
     #[test]
@@ -700,5 +1297,202 @@ mod tests {
 
         let empty = query_records_by_provider_model(&c, "p1", "nope").unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// 组合清除：时间段 + 供应商 + 模型，只删命中行；结果反馈与审计日志完整。
+    #[test]
+    fn clear_records_combined_scope_deletes_and_audits() {
+        let mut c = conn();
+        for (id, p, m, started) in
+            [("a", "p1", "m1", 100), ("b", "p1", "m2", 200), ("c", "p2", "m1", 300), ("d", "p1", "m1", 500)]
+        {
+            let mut r = rec(id, m, started);
+            r.provider_id = p.into();
+            insert_record(&c, &r).unwrap();
+        }
+        // 预览：p1 的 m1，时间 [0, 400] → 只命中 a
+        let scope = ClearScope {
+            since: Some(0), until: Some(400),
+            providers: vec![],
+            models: vec![ModelSel { provider_id: "p1".into(), model_id: "m1".into() }],
+        };
+        let pv = preview_clear(&c, &scope).unwrap();
+        assert_eq!(pv.deleted_count, 1);
+        assert_eq!(pv.confirm_token, "删除1");
+        assert_eq!(pv.models.len(), 1);
+
+        // 授权短语错误 → 拒绝且不删除
+        let err = clear_records(&mut c, &scope, "删除2", "tester").unwrap_err();
+        assert!(err.to_string().contains("授权确认"), "实际错误: {err}");
+        assert_eq!(query_summary(&c, 0, i64::MAX, None).unwrap().request_count, 4);
+
+        // 正确短语 → 删除 a；反馈与审计完整
+        let res = clear_records(&mut c, &scope, "删除1", "tester").unwrap();
+        assert_eq!(res.deleted_count, 1);
+        assert_eq!(res.affected_since, Some(100));
+        assert_eq!(res.affected_until, Some(100));
+        assert_eq!(res.affected_providers, vec!["p1".to_string()]);
+        assert_eq!(res.affected_models.len(), 1);
+        assert!(!res.cursor_reset);
+
+        let s = query_summary(&c, 0, i64::MAX, None).unwrap();
+        assert_eq!(s.request_count, 3, "a 已删除，其余保留");
+
+        let logs = list_audit_logs(&c, 10).unwrap();
+        assert_eq!(logs.len(), 1);
+        let a = &logs[0];
+        assert_eq!(a.actor, "tester");
+        assert_eq!(a.action, "clear_usage");
+        assert_eq!((a.started_at_from, a.started_at_to), (Some(0), Some(400)));
+        assert_eq!(a.models.len(), 1);
+        assert_eq!(a.providers.len(), 0, "模型级选择不等于供应商级");
+        assert_eq!(a.deleted_count, 1);
+    }
+
+    /// 清除边界：时间倒置 / 供应商不存在 / 模型不属于供应商 / 范围无数据 / 模型不存在。
+    #[test]
+    fn clear_records_validates_boundary_conditions() {
+        let mut c = conn();
+        insert_record(&c, &rec("a", "m1", 100)).unwrap();
+
+        // 开始时间晚于结束时间
+        let bad_time = ClearScope { since: Some(200), until: Some(100), providers: vec![], models: vec![] };
+        let err = preview_clear(&c, &bad_time).unwrap_err();
+        assert!(err.to_string().contains("晚于结束时间"), "实际错误: {err}");
+
+        // 供应商不存在
+        let no_provider = ClearScope {
+            since: None, until: None,
+            providers: vec!["ghost".into()], models: vec![],
+        };
+        let err = preview_clear(&c, &no_provider).unwrap_err();
+        assert!(err.to_string().contains("供应商「ghost」不存在"), "实际错误: {err}");
+
+        // 模型存在但不属于所选供应商（m1 只在 p1 下）
+        let wrong_owner = ClearScope {
+            since: None, until: None,
+            providers: vec![],
+            models: vec![ModelSel { provider_id: "p2".into(), model_id: "m1".into() }],
+        };
+        let err = preview_clear(&c, &wrong_owner).unwrap_err();
+        assert!(err.to_string().contains("不属于供应商"), "实际错误: {err}");
+
+        // 模型完全不存在
+        let no_model = ClearScope {
+            since: None, until: None,
+            providers: vec![],
+            models: vec![ModelSel { provider_id: "p1".into(), model_id: "nope".into() }],
+        };
+        let err = preview_clear(&c, &no_model).unwrap_err();
+        assert!(err.to_string().contains("不存在"), "实际错误: {err}");
+
+        // 范围内无数据（时间窗口错开）
+        let empty_range = ClearScope { since: Some(999999), until: Some(1000000), providers: vec![], models: vec![] };
+        let err = preview_clear(&c, &empty_range).unwrap_err();
+        assert!(err.to_string().contains("没有数据"), "实际错误: {err}");
+    }
+
+    /// 全清：删除全部行、重置游标、写全域墓碑；审计记录供应商与模型为空（= 不限）。
+    #[test]
+    fn clear_records_full_clear_resets_cursor() {
+        let mut c = conn();
+        insert_record(&c, &rec("a", "m1", 100)).unwrap();
+        set_cursor(&c, "src", 100, 7, 9).unwrap();
+
+        let scope = ClearScope { since: None, until: None, providers: vec![], models: vec![] };
+        let pv = preview_clear(&c, &scope).unwrap();
+        assert_eq!(pv.deleted_count, 1);
+        let res = clear_records(&mut c, &scope, "删除1", "tester").unwrap();
+        assert_eq!(res.deleted_count, 1);
+        assert!(res.cursor_reset);
+        assert!(get_cursor(&c, "src").unwrap().is_none(), "全清后游标应被重置");
+
+        // 全域墓碑：覆盖 [0, now]
+        let tombs = list_tombstones(&c).unwrap();
+        assert_eq!(tombs.len(), 1);
+        assert_eq!(tombs[0].ts_from, 0);
+        assert!(tombs[0].provider_id.is_none() && tombs[0].model_id.is_none());
+        assert!(is_tombstoned(50, "p1", "m1", &tombs));
+
+        let a = &list_audit_logs(&c, 10).unwrap()[0];
+        assert_eq!(a.deleted_count, 1);
+        assert_eq!((a.started_at_from, a.started_at_to), (None, None));
+        assert!(a.providers.is_empty() && a.models.is_empty(), "全清时供应商/模型列表为空 = 不限");
+    }
+
+    /// 部分清除写的墓碑必须拦下命中行、放行其它行（sync 防回灌的 DAO 侧前提）。
+    #[test]
+    fn tombstones_filter_matching_rows_only() {
+        let mut c = conn();
+        insert_record(&c, &rec("a", "m1", 100)).unwrap();
+        let scope = ClearScope {
+            since: Some(0), until: Some(150),
+            providers: vec!["p1".into()], models: vec![],
+        };
+        clear_records(&mut c, &scope, "删除1", "tester").unwrap();
+
+        let tombs = list_tombstones(&c).unwrap();
+        assert!(is_tombstoned(100, "p1", "m1", &tombs), "区间内的行被拦");
+        assert!(is_tombstoned(100, "p1", "m2", &tombs), "供应商级墓碑拦该供应商全部模型");
+        assert!(!is_tombstoned(100, "p2", "m1", &tombs), "其它供应商不受影响");
+        assert!(!is_tombstoned(999, "p1", "m1", &tombs), "区间外不拦");
+    }
+
+    /// 未定价清单：按 (provider, model) 分组，估算区间取同供应商已定价行的
+    /// 每 token 单价范围；无可参照时为 None。
+    #[test]
+    fn query_unpriced_models_groups_and_estimates() {
+        let c = conn();
+        // p1 已定价参照：a=1500 tokens 0.0003 → 单价 0.0000002；b=1000 tokens 0.0006 → 单价 0.0000006
+        let mut a = rec("a", "m1", 10);
+        a.input_tokens = 1000; a.output_tokens = 500; a.total_cost_usd = "0.0003".into();
+        let mut b = rec("b", "m1", 20);
+        b.input_tokens = 1000; b.output_tokens = 0; b.total_cost_usd = "0.0006".into();
+        // p1 未定价：u1（同模型）与 u2
+        let mut u1 = rec("u1", "m1", 30);
+        u1.priced = false; u1.total_cost_usd = "0".into();
+        let mut u2 = rec("u2", "m2", 40);
+        u2.priced = false; u2.total_cost_usd = "0".into(); u2.provider_id = "p1".into();
+        // p2 未定价：该供应商无已定价参照 → 无法估算
+        let mut u3 = rec("u3", "m1", 50);
+        u3.priced = false; u3.total_cost_usd = "0".into(); u3.provider_id = "p2".into();
+        for r in [&a, &b, &u1, &u2, &u3] { insert_record(&c, r).unwrap(); }
+
+        let rows = query_unpriced_models(&c, 0, i64::MAX, None).unwrap();
+        assert_eq!(rows.len(), 3, "p1/m1、p1/m2、p2/m1 三个未定价组合");
+
+        let p1m1 = rows.iter().find(|r| r.provider_id == "p1" && r.model_id == "m1").unwrap();
+        assert_eq!(p1m1.request_count, 1);
+        assert_eq!(p1m1.total_tokens, 1500);
+        // 估算区间 = 1500 × [0.0000002, 0.0000006] = [0.0003, 0.0009]
+        let lo = Decimal::from_str(p1m1.est_cost_low_usd.as_ref().unwrap()).unwrap();
+        let hi = Decimal::from_str(p1m1.est_cost_high_usd.as_ref().unwrap()).unwrap();
+        assert_eq!(lo, Decimal::from_str("0.0003").unwrap());
+        assert_eq!(hi, Decimal::from_str("0.0009").unwrap());
+
+        let p2m1 = rows.iter().find(|r| r.provider_id == "p2").unwrap();
+        assert!(p2m1.est_cost_low_usd.is_none() && p2m1.est_cost_high_usd.is_none(),
+                "无可参照已定价行时应为 None（无法估算）");
+
+        // 范围筛选跟随：只看 p2 → 只剩 p2 的未定价组合
+        let scope = ScopeFilter { providers: vec!["p2".into()], models: vec![] };
+        let rows = query_unpriced_models(&c, 0, i64::MAX, Some(&scope)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider_id, "p2");
+    }
+
+    #[test]
+    fn list_provider_models_returns_distinct_sorted_pairs() {
+        let c = conn();
+        for (id, p, m) in [("a", "p2", "m1"), ("b", "p1", "m2"), ("c", "p1", "m1"), ("d", "p1", "m1")] {
+            let mut r = rec(id, m, 10);
+            r.provider_id = p.into();
+            insert_record(&c, &r).unwrap();
+        }
+        let rows = list_provider_models(&c).unwrap();
+        let pairs: Vec<(String, String)> = rows.into_iter().map(|r| (r.provider_id, r.model_id)).collect();
+        assert_eq!(pairs, vec![
+            ("p1".into(), "m1".into()), ("p1".into(), "m2".into()), ("p2".into(), "m1".into()),
+        ], "去重且按 provider、model 排序");
     }
 }

@@ -49,6 +49,32 @@ pub fn migrate(conn: &Connection) -> Result<(), AppError> {
           cache_creation_cost_per_million TEXT NOT NULL,
           PRIMARY KEY (provider_id, model_id)
         );
+
+        -- 清除操作的审计日志（providers/models 存 JSON 数组字符串）。
+        CREATE TABLE IF NOT EXISTS audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          actor TEXT NOT NULL,
+          action TEXT NOT NULL,
+          started_at_from INTEGER,
+          started_at_to INTEGER,
+          providers TEXT NOT NULL DEFAULT '[]',
+          models TEXT NOT NULL DEFAULT '[]',
+          deleted_count INTEGER NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+
+        -- 清除墓碑：记录已被清除的范围，防止 sync 重叠窗口把已删行从 ZCode 源库
+        -- 重新灌回（源库只读，删除只发生在自有库）。provider_id/model_id 为 NULL
+        -- 表示不限维度；时间边界为闭区间 [ts_from, ts_to]。
+        CREATE TABLE IF NOT EXISTS clear_tombstones (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_from INTEGER NOT NULL,
+          ts_to INTEGER NOT NULL,
+          provider_id TEXT,
+          model_id TEXT,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tombstones_time ON clear_tombstones(ts_from, ts_to);
         "#,
     )?;
 

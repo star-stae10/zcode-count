@@ -60,14 +60,34 @@ export function rangeLabel(range: Range): string {
   }
 }
 
+/**
+ * 成本可信度：按未定价 token 占比（未定价 token / 总 token，input+output 口径）分级。
+ * - 0 未定价 → 高（成本完整可信）
+ * - 占比 < 20% → 中
+ * - 其余 → 低
+ */
+export function costConfidence(unpricedTokens: number, totalTokens: number): { label: string; level: "high" | "medium" | "low" } {
+  if (unpricedTokens <= 0 || totalTokens <= 0) return { label: "高", level: "high" };
+  const ratio = unpricedTokens / totalTokens;
+  if (ratio < 0.2) return { label: "中（未定价 token 占比 " + (ratio * 100).toFixed(1) + "%）", level: "medium" };
+  return { label: "低（未定价 token 占比 " + (ratio * 100).toFixed(1) + "%）", level: "low" };
+}
+
+/** 毫秒时间戳 → "YYYY/MM/DD HH:mm"（用于时间范围展示）。 */
+export function formatDateTime(ms: number): string {
+  const d = new Date(ms);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 /** 把 "YYYY-MM-DD" 解析为本地日零点毫秒。 */
-function dateStart(s: string): number {
+export function dateStart(s: string): number {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d).getTime();
 }
 
-/** "YYYY-MM-DD" 次日本地零点毫秒（作为含结束日的上界）。 */
-function dateEndExclusive(s: string): number {
+/** "YYYY-MM-DD" 次日本地零点毫秒（作为含结束日的闭区间上界）。 */
+export function dateEndExclusive(s: string): number {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d + 1).getTime();
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatTokens, formatCost, formatCostWithUnpriced, rangeToWindow, rangeLabel } from "./format";
+import { formatTokens, formatCost, formatCostWithUnpriced, costConfidence, rangeToWindow, rangeLabel } from "./format";
 
 describe("formatTokens", () => {
   it("formats thousands and millions", () => {
@@ -57,5 +57,25 @@ describe("rangeLabel", () => {
     expect(rangeLabel("7d")).toBe("7 天");
     expect(rangeLabel("30d")).toBe("30 天");
     expect(rangeLabel("custom")).toBe("自定义");
+  });
+});
+
+describe("costConfidence", () => {
+  it("is high when everything is priced", () => {
+    expect(costConfidence(0, 1000).level).toBe("high");
+    expect(costConfidence(0, 1000).label).toBe("高");
+    expect(costConfidence(0, 0).level).toBe("high");
+  });
+
+  it("is medium when unpriced ratio is below 20%", () => {
+    const c = costConfidence(100, 1000);
+    expect(c.level).toBe("medium");
+    expect(c.label).toContain("10.0%");
+  });
+
+  it("is low when unpriced ratio reaches 20%", () => {
+    const c = costConfidence(200, 1000);
+    expect(c.level).toBe("low");
+    expect(c.label).toContain("20.0%");
   });
 });

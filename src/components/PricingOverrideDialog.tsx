@@ -22,10 +22,17 @@ export function validatePrices(input: string, output: string, cacheRead: string,
 
 export function PricingOverrideDialog(props: {
   providers: string[]; onClose: () => void; onChanged: () => void;
+  initialProvider?: string; initialModel?: string;
 }) {
-  const [providerSel, setProviderSel] = useState(props.providers[0] ?? CUSTOM);
-  const [customProvider, setCustomProvider] = useState("");
-  const [modelId, setModelId] = useState("");
+  const [providerSel, setProviderSel] = useState(
+    props.initialProvider && props.providers.includes(props.initialProvider)
+      ? props.initialProvider
+      : (props.initialProvider ? CUSTOM : (props.providers[0] ?? CUSTOM)),
+  );
+  const [customProvider, setCustomProvider] = useState(
+    props.initialProvider && !props.providers.includes(props.initialProvider) ? props.initialProvider : "",
+  );
+  const [modelId, setModelId] = useState(props.initialModel ?? "");
   const [input, setInput] = useState("");
   const [output, setOutput] = useState("");
   const [cacheRead, setCacheRead] = useState("");

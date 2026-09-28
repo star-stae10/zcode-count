@@ -17,6 +17,8 @@ pub struct SyncReport {
     pub scanned: i64,
     pub imported: i64,
     pub skipped: i64,
+    /// 命中清除墓碑而跳过的行数（用户已清除的范围，不允许从源库回灌）。
+    pub tombstoned: i64,
     pub unpriced: i64,
     pub repriced: i64,
     pub last_started_at: i64,
@@ -71,12 +73,18 @@ pub fn sync(
 
         let rows = query_rows(&zconn, since)?;
         report.scanned = rows.len() as i64;
+        // 清除墓碑：用户清除过的范围不允许被重叠窗口从源库灌回。
+        let tombs = dao::list_tombstones(conn)?;
         // 从当前水位线起步，避免在「窗口内无新行」时把游标回退。
         let mut max_started = cursor.as_ref().map_or(0, |c| c.last_started_at);
 
         for r in &rows {
             if r.started_at > max_started {
                 max_started = r.started_at;
+            }
+            if dao::is_tombstoned(r.started_at, &r.provider_id, &r.model_id, &tombs) {
+                report.tombstoned += 1;
+                continue;
             }
             let cost = resolve(&r.provider_id, &r.model_id, pricing, overrides)
                 .map(|p| calculate_cache_inclusive(r.input_tokens, r.output_tokens, r.cache_read, r.cache_creation, &p));
@@ -632,6 +640,58 @@ mod tests {
 
         let logs = crate::db::dao::query_logs(&conn, 0, 1000, None, 100).unwrap();
         assert_eq!(logs.len(), 1); // 记录数不变
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    /// 清除墓碑防回灌：清除某范围后，源库中相同行在重叠窗口内被再次扫描时
+    /// 必须被墓碑过滤（不导入、单独计数），范围外的行照常导入。
+    #[test]
+    fn cleared_rows_are_not_resynced_from_source() {
+        const DAY: i64 = 24 * 60 * 60 * 1000;
+        let dir = std::env::temp_dir().join(format!("zc-test-tomb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        insert_usage(&zpath, "keep", 10 * DAY);
+        insert_usage(&zpath, "gone", 5 * DAY);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let overrides = HashMap::new();
+
+        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(first.imported, 2);
+
+        // 清除 p1 在 [0, 6*DAY] 的数据（命中 gone），写墓碑
+        let scope = crate::db::dao::ClearScope {
+            since: Some(0),
+            until: Some(6 * DAY),
+            providers: vec!["p1".into()],
+            models: vec![],
+        };
+        let mut conn = conn; // clear_records 需要 &mut Connection
+        let res = crate::db::dao::clear_records(&mut conn, &scope, "删除1", "tester").unwrap();
+        assert_eq!(res.deleted_count, 1);
+
+        // 改动源库使 mtime 变化（绕过短路），并新增一行区间外的新数据
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        insert_usage(&zpath, "fresh", 20 * DAY);
+        assert_ne!(
+            max_mtime(&zpath),
+            crate::db::dao::get_cursor(&conn, &zpath.to_string_lossy()).unwrap().unwrap().last_mtime,
+            "mtime 未变化，测试前提不成立"
+        );
+
+        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        assert_eq!(second.tombstoned, 1, "重叠窗口内的已删行必须被墓碑过滤");
+        assert_eq!(second.imported, 1, "只有区间外的新行被导入");
+
+        let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        let ids: Vec<&str> = logs.iter().map(|l| l.request_id.as_str()).collect();
+        assert!(ids.contains(&"keep") && ids.contains(&"fresh"));
+        assert!(!ids.contains(&"gone"), "已清除的行不得从源库回灌");
 
         let _ = std::fs::remove_file(&zpath);
     }

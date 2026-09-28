@@ -1,5 +1,7 @@
 import { Range } from "../lib/format";
 import { SyncStatus } from "../lib/api";
+import { ModelSel, ScopeFilter } from "../lib/api";
+import { ScopeChips, scopeSummary } from "./ScopePicker";
 
 const RANGES: { id: Range; label: string }[] = [
   { id: "all", label: "全部" }, { id: "today", label: "当天" },
@@ -10,11 +12,17 @@ const RANGES: { id: Range; label: string }[] = [
 export function Toolbar(props: {
   range: Range; onRange: (r: Range) => void;
   status: SyncStatus | null; onRefresh: () => void; loading: boolean;
-  provider: string | null; onProvider: (p: string | null) => void; providers: string[];
+  scope: ScopeFilter;
+  onOpenScope: () => void;
+  onRemoveScopeProvider: (p: string) => void;
+  onRemoveScopeModel: (m: ModelSel) => void;
+  onClearScope: () => void;
   customSince: string; customUntil: string;
   onCustomSince: (v: string) => void; onCustomUntil: (v: string) => void;
   onOpenPricing: () => void;
+  onOpenClear: () => void;
 }) {
+  const scopeActive = props.scope.providers.length > 0 || props.scope.models.length > 0;
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 px-4 py-3">
       <div className="flex gap-1">
@@ -37,12 +45,17 @@ export function Toolbar(props: {
             className="rounded border border-gray-300 px-2 py-1 text-sm" />
         </div>
       )}
-      <select value={props.provider ?? ""}
-        onChange={(e) => props.onProvider(e.target.value || null)}
-        className="rounded border border-gray-300 px-2 py-1 text-sm">
-        <option value="">全部供应商</option>
-        {props.providers.map((p) => <option key={p} value={p}>{p}</option>)}
-      </select>
+      {/* 核算范围：仅筛选展示，不删除数据（与「清除数据」在文案与颜色上明确区分） */}
+      <button onClick={props.onOpenScope}
+        className={`rounded px-3 py-1 text-sm ${scopeActive ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-700"}`}>
+        核算范围{scopeActive ? `（${scopeSummary(props.scope)}）` : "（全部）"}
+      </button>
+      <ScopeChips
+        selected={props.scope}
+        onRemoveProvider={props.onRemoveScopeProvider}
+        onRemoveModel={props.onRemoveScopeModel}
+        onClear={props.onClearScope}
+      />
       <button onClick={props.onRefresh} disabled={props.loading}
         className="rounded bg-gray-800 px-3 py-1 text-sm text-white disabled:opacity-50">
         {props.loading ? "同步中…" : "刷新"}
@@ -50,6 +63,10 @@ export function Toolbar(props: {
       <button onClick={props.onOpenPricing}
         className="rounded bg-gray-100 px-3 py-1 text-sm text-gray-700">
         定价覆盖
+      </button>
+      <button onClick={props.onOpenClear}
+        className="rounded bg-red-600 px-3 py-1 text-sm text-white">
+        清除数据
       </button>
       <span className="text-xs text-gray-500">
         {props.status?.last_synced_at
