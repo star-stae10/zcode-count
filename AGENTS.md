@@ -32,16 +32,16 @@ React UI  src/  （汇总卡 + 三页签：请求日志 / Provider 统计 / 模�
 
 ```
 src-tauri/src/
-├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 8 个命令）
-├─ commands.rs       # AppState、SyncStatus、8 个 Tauri 命令
+├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 13 个命令）
+├─ commands.rs       # AppState、SyncStatus、13 个 Tauri 命令（统计 4 + 清除/审计 4 + 未定价/层级 2 + 定价覆盖 3）
 ├─ error.rs          # AppError（thiserror；实现 Serialize 供命令返回）
 ├─ db/
 │  ├─ mod.rs         # OwnDb { pub conn: Mutex<Connection> }、default_db_path()
-│  ├─ schema.rs      # migrate()：建 usage_records / sync_cursors / pricing_overrides + 幂等补列
-│  └─ dao.rs         # 结构体 + 查询：insert_record/get_cursor/set_cursor/query_summary/
-│                    #   query_logs/query_provider_stats/query_model_stats/get_overrides/
-│                    #   set_override/delete_override/list_overrides/query_unpriced_records/
-│                    #   query_records_by_provider_model/update_record_pricing
+│  ├─ schema.rs      # migrate()：usage_records / sync_cursors / pricing_overrides / audit_log / clear_tombstones + 幂等补列
+│  └─ dao.rs         # 结构体 + 查询 + ScopeFilter 范围筛选（scope_condition/time_condition，统计 4 查询共用）
+│                    #   + 清除（validate_clear_scope/preview_clear/clear_records，事务：删除+墓碑+游标+审计）
+│                    #   + 审计（insert_audit_log/list_audit_logs）+ 墓碑（list_tombstones/is_tombstoned）
+│                    #   + 未定价清单（query_unpriced_models，含成本估算区间）+ 层级（list_provider_models）
 ├─ pricing/
 │  ├─ mod.rs         # ModelPricing、cc_switch_db_path()、resolve()
 │  ├─ candidates.rs  # model_candidates()：模型名归一化
@@ -49,13 +49,16 @@ src-tauri/src/
 │  └─ table.rs       # PricingTable：load(只读) / from_rows / lookup(精确→前缀)
 └─ zcode/
    ├─ mod.rs         # zcode_db_path()
-   └─ sync.rs        # SyncReport、sync()：增量同步 + 自动重定价
+   └─ sync.rs        # SyncReport（含 tombstoned 计数）、sync()：增量同步 + 墓碑过滤 + 自动重定价
 
 src/
 ├─ lib/api.ts        # invoke 封装 + 全部前端类型（字段 snake_case，与 Rust Serialize 对齐）
 ├─ lib/format.ts     # formatTokens/formatCost/formatCostWithUnpriced/formatTime/rangeToWindow/rangeLabel
-├─ components/       # Toolbar / SummaryCards / Tabs / RequestLogTable / ProviderStatsTable / ModelStatsTable / PricingOverrideDialog
-└─ App.tsx           # range/tab/status/summary/logs/stats/error/loading state + refresh()
+│                    #   + costConfidence（成本可信度）+ formatDateTime + dateStart/dateEndExclusive
+├─ components/       # Toolbar / SummaryCards / Tabs / RequestLogTable / ProviderStatsTable / ModelStatsTable
+│                    #   / PricingOverrideDialog（支持预填）/ ScopePicker（供应商>模型层级多选，核算与清除共用）
+│                    #   / ScopeDialog（核算范围）/ ClearDataDialog（清除流程）/ UnpricedDialog / AuditLogDialog
+└─ App.tsx           # range/scope/tab/status/summary/logs/stats/unpriced state + refresh()（Promise.all 并行 + 请求序号防竞态）
 
 .github/workflows/build.yml   # Windows CI 构建
 docs/superpowers/             # 设计文档（specs/）与实施计划（plans/），历史留档
@@ -112,7 +115,16 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 9. **`query_source`**（ZCode 的 `main_turn`/`subagent`/`session_title`/`compact` 等）全链路贯通到请求日志的「来源」列。
 
-10. **供应商筛选全局生效**：工具栏供应商下拉传给 summary / 请求日志 / Provider 统计 / 模型统计四类查询（SQL 用 `AND (?N IS NULL OR provider_id = ?N)` 过滤）。模型统计页「所有模型」合计行取自筛选后的 summary，与明细一致。注意：工具栏下拉与定价覆盖弹窗的供应商**选项**始终来自未筛选的全量统计（`App.tsx` 的 `providerOptions` state），否则筛选后下拉只剩被选供应商、无法切换。
+10. **核算范围筛选全局生效（供应商 > 模型层级）**：原「供应商单选下拉」已升级为「核算范围」多选（`ScopeFilter { providers: Vec<String>, models: Vec<ModelSel> }`，供应商级与模型级**并集**生效）。传给 summary / 请求日志 / Provider 统计 / 模型统计 / 未定价清单五类查询（SQL 片段由 `dao::scope_condition` 动态生成，`provider_id IN (...) OR (provider_id=? AND model_id=?)`）。空 scope = 不筛选（全部）。模型统计页「所有模型」合计行取自筛选后的 summary，与明细一致。核算范围弹窗与定价覆盖弹窗的供应商**选项**始终来自未筛选的全量统计（`App.tsx` 的 `providerOptions`）。**核算范围只影响统计与展示，绝不删除数据**——与「清除数据」在 UI（蓝 vs 红）、文案上严格区分。
+
+11. **清除 = 删除 + 审计 + 墓碑**（`dao::clear_records`，单个事务）：
+    - 范围 = 时间段（可选）+ 供应商集合 + `(provider, model)` 对集合，并集语义；全空 = 全清。
+    - 流程：`validate_clear_scope`（时间倒置 / 供应商不存在 / 模型不存在或归属不符，均明确报错）→ 计数（=0 报「所选范围内没有数据」）→ **授权确认短语校验**（`删除N`，N 为预览条数；预览后数据变化会自然校验失败，防误删）→ DELETE → 写 `clear_tombstones` → 全清时重置 `sync_cursors` → 写 `audit_log`。
+    - **墓碑是关键**：ZCode 源库只读，sync 重叠窗口（7 天）会把已删行从源库重新灌回。sync 扫描后、插入前用 `dao::is_tombstoned` 过滤（命中计入 `SyncReport.tombstoned`）。墓碑时间边界缺省 `[0, 清除时刻]`；全清写一条全域墓碑并重置游标。清除后新请求（`started_at` 晚于清除时刻）正常进入；清除时刻前已开始、之后才完成的行会被挡（属"清除时已存在的历史"，语义如此）。若要恢复，需手动删墓碑行 + 重置游标（无 UI）。
+    - 权限：单机工具无账号体系，「仅授权用户」由后端强制校验确认短语实现；审计「操作人」取 `USERNAME` 环境变量。
+    - 预览命令 `preview_clear_usage`（dry-run）返回条数与 `confirm_token`；清除命令 `clear_usage` 再算一遍条数并校验短语。
+
+12. **未定价警告与成本可信度**：`Summary` 含 `unpriced_tokens`（未定价行 input+output）与 `unpriced_models`（未定价 (provider, model) 组合数）。`unpriced_count > 0` 时 SummaryCards 显示琥珀色警告（文案明示"实际成本可能高于显示值"）+ 可信度（`format.ts::costConfidence`：未定价 token 占比 0% → 高 / <20% → 中 / 其余 → 低）。`UnpricedDialog` 明细来自 `get_unpriced_models`：按 (provider, model) 分组，估算区间 = 未定价 token × 同供应商已定价行的每 token 单价范围（`[min,max]`），无可参照行 → None（显示"无法估算"）。每行有「补充定价」按钮 → 打开 `PricingOverrideDialog` 并预填该组合。
 
 ## 5. 数据源 schema 速查
 
@@ -124,6 +136,8 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 **`sync_cursors`**：`source(PK, ZCode库路径), last_started_at, last_mtime, last_synced_at`
 **`pricing_overrides`**：`(provider_id, model_id)(PK) + 四个单价`（UI：工具栏「定价覆盖」弹窗）
+**`audit_log`**：`id, actor(操作人), action('clear_usage'), started_at_from/to(时间段,可 NULL), providers(JSON 数组), models(JSON 数组 [{provider_id,model_id}]), deleted_count, created_at`
+**`clear_tombstones`**：`id, ts_from, ts_to(闭区间,ms), provider_id(NULL=不限), model_id(NULL=该供应商下不限), created_at`
 
 ## 6. 扩展新功能的套路
 
@@ -158,7 +172,6 @@ CI：`.github/workflows/build.yml`，`windows-latest`，跑 `cargo test` + `pnpm
 
 - **模型名归一化对 `:` 处理过激**：`gemma4:31b-cloud` 会被截成 `gemma4` → 查不到价（显示 `—`）。如需支持 ollama 风格 ID 要改 `pricing/candidates.rs`。
 - **定价候选是 cc-switch 的简化子集**：未实现 ISO 日期变体、reasoning-effort 后缀、claude `.`→`-`、前缀匹配门控等。换模型后可能漏配/错配（实测当前数据无错配）。
-- **前端 `refresh()` 竞态**：快速切换时间范围时无请求序号，旧响应可能覆盖新状态；且 `refresh` 串行 5 个 IPC await，`sync` 失败会阻断数据刷新。
 - **切换时间范围会触发一次 sync**（mtime 短路使开销很小，但语义耦合）。
 - **死字段**：`SyncStatus.last_error` 恒为 None；`usage_records.created_at` 实际存的是 `started_at`。
 - **模板残留**：`Cargo.toml` 的 `description`/`authors` 是默认值；`@tauri-apps/plugin-opener` 依赖未使用。（index.html 标题/favicon 已随图标更换修复。）
@@ -166,6 +179,7 @@ CI：`.github/workflows/build.yml`，`windows-latest`，跑 `cargo test` + `pnpm
 - **迁移无 `PRAGMA user_version`**：靠 ad-hoc 列检查。
 - **`formatCost` 对极小金额显示 `$0.00000`**（5 位小数）。
 - **CI**：actions 有 Node 20 deprecation 警告（不影响构建）；可考虑升级 action 版本。
+- **DeepSeek 峰谷定价未适配**：现状按单一空闲档计价，DeepSeek 系成本低估约 13%（阈值 1.5%）。待办见根目录 `todo.md` —— 🔴 **须经仓库所有者明确同意后 AI 才可实施，禁止擅自实现。**
 
 ## 9. 历史留档
 
