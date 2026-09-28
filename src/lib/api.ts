@@ -111,6 +111,11 @@ export const getSummary = (since: number, until: number, scope: ScopeFilter | nu
   invoke<Summary>("get_summary", { since, until, scope });
 export const listLogs = (since: number, until: number, scope: ScopeFilter | null, limit: number) =>
   invoke<RequestLogRow[]>("list_logs", { since, until, scope, limit });
+/** 导出请求日志（当前筛选下的全部行）到指定路径，返回导出行数。 */
+export const exportLogs = (
+  path: string, format: "csv" | "json",
+  since: number, until: number, scope: ScopeFilter | null,
+) => invoke<number>("export_logs", { path, format, since, until, scope });
 export const getProviderStats = (since: number, until: number, scope: ScopeFilter | null) =>
   invoke<ProviderStat[]>("get_provider_stats", { since, until, scope });
 export const getModelStats = (since: number, until: number, scope: ScopeFilter | null) =>

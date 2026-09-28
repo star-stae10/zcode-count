@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Range } from "../lib/format";
 import { SyncStatus } from "../lib/api";
 import { ModelSel, ScopeFilter } from "../lib/api";
@@ -23,8 +24,12 @@ export function Toolbar(props: {
   onCustomSince: (v: string) => void; onCustomUntil: (v: string) => void;
   onOpenPricing: () => void;
   onOpenClear: () => void;
+  onExport: (format: "csv" | "json") => void;
+  exporting: boolean;
+  exportNotice: string | null;
 }) {
   const scopeActive = props.scope.providers.length > 0 || props.scope.models.length > 0;
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   return (
     <div className="flex flex-wrap items-center gap-3 border-b border-gray-200 px-4 py-3">
       <div className="flex gap-1">
@@ -63,6 +68,33 @@ export function Toolbar(props: {
         className="rounded bg-gray-800 px-3 py-1 text-sm text-white disabled:opacity-50">
         {props.loading ? "同步中…" : "刷新"}
       </button>
+      {/* 导出：按当前时间范围 + 核算范围导出请求日志（下拉选格式） */}
+      <div className="relative">
+        <button onClick={() => setExportMenuOpen((v) => !v)} disabled={props.exporting}
+          className="rounded bg-gray-100 px-3 py-1 text-sm text-gray-700 disabled:opacity-50">
+          {props.exporting ? "导出中…" : "导出"}
+        </button>
+        {exportMenuOpen && (
+          <>
+            {/* 全屏透明遮罩：点击菜单外任意处关闭 */}
+            <div className="fixed inset-0 z-40" onClick={() => setExportMenuOpen(false)} />
+            <div className="absolute left-0 top-full z-50 mt-1 w-48 rounded border border-gray-200 bg-white py-1 shadow-lg">
+              <div className="px-3 py-1 text-xs text-gray-400">按当前时间范围与核算范围导出请求日志</div>
+              <button
+                onClick={() => { setExportMenuOpen(false); props.onExport("csv"); }}
+                className="block w-full px-3 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-100">
+                导出 CSV（Excel）
+              </button>
+              <button
+                onClick={() => { setExportMenuOpen(false); props.onExport("json"); }}
+                className="block w-full px-3 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-100">
+                导出 JSON
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+      {props.exportNotice && <span className="text-xs text-green-600">{props.exportNotice}</span>}
       <button onClick={props.onOpenPricing}
         className="rounded bg-gray-100 px-3 py-1 text-sm text-gray-700">
         定价覆盖

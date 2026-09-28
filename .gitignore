@@ -24,5 +24,6 @@ dist-ssr
 *.sw?
 
 # ZCode CLI 工具文件与用户素材（不入库）
+.zcode/
 .zcodeignore
 ChatGPT Image*.png

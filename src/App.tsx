@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   syncUsage, getSummary, listLogs, getProviderStats, getModelStats,
-  listProviderModels, getUnpricedModels, listProviderNames,
+  listProviderModels, getUnpricedModels, listProviderNames, exportLogs,
   Summary, SyncStatus, RequestLogRow, ProviderStat, ModelStat,
   ProviderModelRow, UnpricedModelRow, ScopeFilter, ProviderNameRow,
 } from "./lib/api";
-import { Range, rangeToWindow } from "./lib/format";
+import { Range, rangeToWindow, exportFileName } from "./lib/format";
 import { ProviderNames } from "./lib/providerName";
 import { Toolbar } from "./components/Toolbar";
 import { SummaryCards } from "./components/SummaryCards";
@@ -55,6 +56,10 @@ export default function App() {
   const [clearOpen, setClearOpen] = useState(false);
   const [auditOpen, setAuditOpen] = useState(false);
   const [unpricedOpen, setUnpricedOpen] = useState(false);
+  // 导出：进行中 + 成功提示（失败走全局 error；提示数秒后自动消失）
+  const [exporting, setExporting] = useState(false);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const exportNoticeTimer = useRef<number | null>(null);
   // 请求序号：防止快速切换筛选时旧响应覆盖新状态
   const refreshSeq = useRef(0);
 
@@ -117,6 +122,34 @@ export default function App() {
 
   useEffect(() => { void refresh(); }, [range, scope, customSince, customUntil]);
 
+  // 导出请求日志：先弹系统保存对话框选路径（取消则静默返回），再由后端
+  // 按当前时间范围 + 核算范围生成文件（与请求日志页签同口径，但不设条数上限）。
+  async function handleExport(format: "csv" | "json") {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const { since, until } = rangeToWindow(range, customSince, customUntil);
+      const scopeParam = scope.providers.length > 0 || scope.models.length > 0 ? scope : null;
+      const path = await save({
+        defaultPath: exportFileName(range, customSince, customUntil, format),
+        filters: [
+          format === "csv"
+            ? { name: "CSV 文件", extensions: ["csv"] }
+            : { name: "JSON 文件", extensions: ["json"] },
+        ],
+      });
+      if (!path) return;
+      const n = await exportLogs(path, format, since, until, scopeParam);
+      setExportNotice(`已导出 ${n} 条`);
+      if (exportNoticeTimer.current != null) window.clearTimeout(exportNoticeTimer.current);
+      exportNoticeTimer.current = window.setTimeout(() => setExportNotice(null), 4000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
+
   function openUnpriced() {
     setUnpricedOpen(true);
     void fetchUnpriced();
@@ -143,6 +176,9 @@ export default function App() {
         onCustomSince={setCustomSince} onCustomUntil={setCustomUntil}
         onOpenPricing={() => { setPricingInitial({}); setPricingOpen(true); }}
         onOpenClear={() => setClearOpen(true)}
+        onExport={handleExport}
+        exporting={exporting}
+        exportNotice={exportNotice}
       />
       {scopeOpen && (
         <ScopeDialog

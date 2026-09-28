@@ -91,3 +91,24 @@ export function dateEndExclusive(s: string): number {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, m - 1, d + 1).getTime();
 }
+
+/** 本地日期 "YYYY-MM-DD"。 */
+function todayLocal(): string {
+  const d = new Date();
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** 导出文件默认名：时间范围编入文件名，扩展名随格式（如 zcode-count-2026-09-28.csv）。 */
+export function exportFileName(
+  range: Range, customSince?: string, customUntil?: string, ext: "csv" | "json" = "csv",
+): string {
+  const stem =
+    range === "all" ? "all"
+    : range === "today" ? todayLocal()
+    : range === "7d" ? "7d"
+    : range === "30d" ? "30d"
+    : customSince && customUntil ? `${customSince}_to_${customUntil}`
+    : "custom";
+  return `zcode-count-${stem}.${ext}`;
+}

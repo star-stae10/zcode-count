@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod export;
 pub mod pricing;
 pub mod zcode;
 
@@ -10,6 +11,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let db_path = crate::db::default_db_path();
             let own = crate::db::OwnDb::open(&db_path).map_err(|e| e.to_string())?;
@@ -20,6 +22,7 @@ pub fn run() {
             crate::commands::sync_usage,
             crate::commands::get_summary,
             crate::commands::list_logs,
+            crate::commands::export_logs,
             crate::commands::get_provider_stats,
             crate::commands::get_model_stats,
             crate::commands::list_provider_models,

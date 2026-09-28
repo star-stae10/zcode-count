@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatTokens, formatCost, formatCostWithUnpriced, costConfidence, rangeToWindow, rangeLabel } from "./format";
+import { formatTokens, formatCost, formatCostWithUnpriced, costConfidence, rangeToWindow, rangeLabel, exportFileName } from "./format";
 
 describe("formatTokens", () => {
   it("formats thousands and millions", () => {
@@ -77,5 +77,22 @@ describe("costConfidence", () => {
     const c = costConfidence(200, 1000);
     expect(c.level).toBe("low");
     expect(c.label).toContain("20.0%");
+  });
+});
+
+describe("exportFileName", () => {
+  it("encodes the time range into the file name", () => {
+    expect(exportFileName("all", undefined, undefined, "csv")).toBe("zcode-count-all.csv");
+    expect(exportFileName("7d", undefined, undefined, "json")).toBe("zcode-count-7d.json");
+    expect(exportFileName("30d", undefined, undefined, "csv")).toBe("zcode-count-30d.csv");
+    expect(exportFileName("custom", "2026-09-01", "2026-09-28", "csv")).toBe("zcode-count-2026-09-01_to_2026-09-28.csv");
+    expect(exportFileName("custom", undefined, undefined, "json")).toBe("zcode-count-custom.json");
+  });
+
+  it("uses today's local date for the today range", () => {
+    const d = new Date();
+    const p = (x: number) => String(x).padStart(2, "0");
+    const today = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    expect(exportFileName("today", undefined, undefined, "csv")).toBe(`zcode-count-${today}.csv`);
   });
 });

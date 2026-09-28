@@ -32,8 +32,9 @@ React UI  src/  （汇总卡 + 三页签：请求日志 / Provider 统计 / 模�
 
 ```
 src-tauri/src/
-├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 14 个命令）
-├─ commands.rs       # AppState、SyncStatus、13 个 Tauri 命令（统计 4 + 清除/审计 4 + 未定价/层级 2 + 定价覆盖 3）
+├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 15 个命令）
+├─ commands.rs       # AppState、SyncStatus、14 个 Tauri 命令（统计 4 + 导出 1 + 清除/审计 4 + 未定价/层级 2 + 定价覆盖 3）
+├─ export.rs         # 请求日志导出渲染（CSV/JSON）：字段与请求日志 10 列一致，CSV 带 BOM/CRLF/引号转义，JSON 英文键 + 机器值
 ├─ error.rs          # AppError（thiserror；实现 Serialize 供命令返回）
 ├─ db/
 │  ├─ mod.rs         # OwnDb { pub conn: Mutex<Connection> }、default_db_path()
@@ -57,6 +58,7 @@ src/
 ├─ lib/api.ts        # invoke 封装 + 全部前端类型（字段 snake_case，与 Rust Serialize 对齐）
 ├─ lib/format.ts     # formatTokens/formatCost/formatCostWithUnpriced/formatTime/rangeToWindow/rangeLabel
 │                    #   + costConfidence（成本可信度）+ formatDateTime + dateStart/dateEndExclusive
+│                    #   + exportFileName（导出默认文件名，时间范围编入文件名）
 ├─ lib/providerName.ts # providerLabel(names, id)：供应商显示名映射（无映射回退原始 ID）；显示用名称、传参/过滤一律仍用原始 provider_id
 ├─ components/       # Toolbar / SummaryCards / Tabs / RequestLogTable / ProviderStatsTable / ModelStatsTable
 │                    #   / PricingOverrideDialog（支持预填 + 命中数/重算反馈）/ ScopePicker（供应商>模型层级多选，核算与清除共用）
@@ -135,6 +137,8 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 14. **覆盖匹配口径统一（单一规则源）**：`pricing::override_lookup` = 先 `(provider, model)` 精确、再按 `model_candidates` 归一化候选匹配，provider 恒精确、空候选覆盖跳过、精确优先。`resolve()` 内部改调它（签名不变）；sync 覆盖重算 pass（`list_models_for_provider` + `override_lookup` 判定命中）与删除覆盖清理（`delete_override_and_clear`）同口径。**禁止在别处另写匹配逻辑**——历史教训：覆盖曾用精确匹配而表价用归一化，同一规则被复制三份导致覆盖静默失效。`OverrideRow.matched_count` 也必须复用 `override_lookup` 计算。
 
 15. **DeepSeek 峰谷定价（以定价覆盖为载体，已获所有者确认实施）**：`pricing_overrides` 可选带 4 个 peak 单价列（NULL = 未启用峰谷）；启用组合由 `TieredPricing::pick(started_at)` 按行判档选价，历史由覆盖重算 pass 全量回填；判档只在 `pricing/tier.rs` 一处（前端「计费档」列由 `list_logs` 命令后处理标注，前端零判档逻辑）。峰/谷两组价全部由用户手填（不依赖 cc-switch 表价口径）；`set_price_override` 的 peak 四参数全填=启用、全空=关闭（普通覆盖价保留）、部分填=报错。节假日表仅覆盖 2026-09-01~2027-01-31（国办发明电〔2025〕7号），**2027-02 起按周几退化，需手动维护 tier.rs**。真实数据对账：双实现互验差异 0.0000%，峰谷较旧单一空闲档 +10.59%（本机窗口）。
+
+16. **导出请求日志（CSV/JSON）**：工具栏「导出」按钮 → `tauri-plugin-dialog` 保存对话框选路径（capabilities 需 `dialog:default`）→ `export_logs` 命令写盘。**口径与 `list_logs` 完全一致**（同 `query_logs` + `annotate_price_tiers` + 供应商显示名映射），但 `limit = i64::MAX` 不截断——导出当前时间范围 + 核算范围下的**全部**行（页签为 500 条）。文件内容渲染集中在 `export.rs`：CSV 中文列头与档位（峰/谷）、UTF-8 BOM + CRLF（Excel 直开不乱码）、引号转义；JSON 英文键（time/provider/model/input_tokens/output_tokens/total_cost_usd/price_tier/duration_text/status/source）、RFC 3339 本地时间、未定价成本为 null（对应 UI「—」）、机器值 "peak"/"off_peak"。修改导出字段时同步改 `csv_fields` 与 `ExportRow` 两处 + `export.rs` 单测。
 
 ## 5. 数据源 schema 速查
 

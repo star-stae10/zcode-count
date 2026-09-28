@@ -4,6 +4,7 @@ use crate::pricing::{cc_switch_db_path, table::PricingTable};
 use crate::zcode::provider_names::{self, ProviderName};
 use crate::zcode::{sync::sync, zcode_db_path};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::State;
 
@@ -96,6 +97,36 @@ pub fn list_logs(state: State<'_, Mutex<AppState>>, since: i64, until: i64, scop
     let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
     dao::annotate_price_tiers(&mut rows, &overrides);
     Ok(rows)
+}
+
+/// 导出请求日志为 CSV / JSON 文件（`path` 来自前端保存对话框）。
+///
+/// 口径与 `list_logs` 完全一致（同筛选条件 + 计费档标注 + 供应商显示名），
+/// 但不设条数上限——导出的是当前时间范围与核算范围下的**全部**行，
+/// 不受请求日志页签 500 条截断影响。返回导出行数。
+#[tauri::command]
+pub fn export_logs(
+    state: State<'_, Mutex<AppState>>,
+    path: String,
+    format: String,
+    since: i64, until: i64,
+    scope: Option<ScopeFilter>,
+) -> Result<usize, String> {
+    let fmt = crate::export::ExportFormat::parse(&format)?;
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    // i64::MAX = 不设上限（SQLite 合法），语义即"筛选条件下的全部行"。
+    let mut rows = dao::query_logs(&conn, since, until, scope.as_ref(), i64::MAX).map_err(|e| e.to_string())?;
+    let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
+    dao::annotate_price_tiers(&mut rows, &overrides);
+    let names: HashMap<String, String> = dao::list_provider_names(&conn)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|n| (n.provider_id, n.display_name))
+        .collect();
+    let content = crate::export::render(fmt, &rows, &names);
+    std::fs::write(&path, content).map_err(|e| format!("写入文件失败（{path}）: {e}"))?;
+    Ok(rows.len())
 }
 
 #[tauri::command]
