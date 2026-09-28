@@ -33,6 +33,14 @@ export interface SyncStatus {
 export interface PriceOverride {
   provider_id: string; model_id: string;
   input: string; output: string; cache_read: string; cache_creation: string;
+  /** 该覆盖当前命中的用量记录条数（0 = 未生效，需检查模型 ID 是否与记录一致）。 */
+  matched_count: number;
+}
+
+/** 供应商名称映射行（来自自有库 provider_names 表，sync 时从 ZCode 配置快照）。 */
+export interface ProviderNameRow {
+  provider_id: string; display_name: string; source: string;
+  base_url: string | null;
 }
 
 /** 「供应商 + 模型」组合（模型级范围选择）。 */
@@ -104,6 +112,8 @@ export const getModelStats = (since: number, until: number, scope: ScopeFilter |
   invoke<ModelStat[]>("get_model_stats", { since, until, scope });
 export const listProviderModels = () =>
   invoke<ProviderModelRow[]>("list_provider_models");
+export const listProviderNames = () =>
+  invoke<ProviderNameRow[]>("list_provider_names");
 export const getUnpricedModels = (since: number, until: number, scope: ScopeFilter | null) =>
   invoke<UnpricedModelRow[]>("get_unpriced_models", { since, until, scope });
 

@@ -17,7 +17,7 @@ function row(over: Partial<ProviderStat> = {}): ProviderStat {
 
 describe("ProviderStatsTable", () => {
   it("renders all columns and row values", () => {
-    const html = renderToStaticMarkup(<ProviderStatsTable rows={[row()]} />);
+    const html = renderToStaticMarkup(<ProviderStatsTable rows={[row()]} names={{}} />);
     for (const c of ["供应商", "请求数", "输入", "输出", "总成本"]) {
       expect(html).toContain(c);
     }
@@ -30,14 +30,31 @@ describe("ProviderStatsTable", () => {
 
   it("renders multiple providers in given order", () => {
     const html = renderToStaticMarkup(
-      <ProviderStatsTable rows={[row({ provider_id: "openai" }), row({ provider_id: "anthropic" })]} />,
+      <ProviderStatsTable rows={[row({ provider_id: "openai" }), row({ provider_id: "anthropic" })]} names={{}} />,
     );
     expect(html.indexOf("openai")).toBeLessThan(html.indexOf("anthropic"));
   });
 
+  it("shows the mapped provider name and keeps the raw id in title", () => {
+    const html = renderToStaticMarkup(
+      <ProviderStatsTable rows={[row({ provider_id: "new-provider" })]} names={{ "new-provider": "OpenCode Go" }} />,
+    );
+    expect(html).toContain("OpenCode Go");
+    expect(html).toContain('title="new-provider"');
+    expect(html).not.toContain(">new-provider<");
+  });
+
+  it("falls back to the raw provider_id without title when unmapped", () => {
+    const html = renderToStaticMarkup(
+      <ProviderStatsTable rows={[row({ provider_id: "new-provider" })]} names={{}} />,
+    );
+    expect(html).toContain("new-provider");
+    expect(html).not.toContain("title=");
+  });
+
   it("shows — for cost when all requests are unpriced", () => {
     const html = renderToStaticMarkup(
-      <ProviderStatsTable rows={[row({ unpriced_count: 3 })]} />,
+      <ProviderStatsTable rows={[row({ unpriced_count: 3 })]} names={{}} />,
     );
     expect(html).toContain("—");
     expect(html).not.toContain("$0.01000");
@@ -45,7 +62,7 @@ describe("ProviderStatsTable", () => {
 
   it("shows ≥ cost when only some requests are priced", () => {
     const html = renderToStaticMarkup(
-      <ProviderStatsTable rows={[row({ unpriced_count: 2 })]} />,
+      <ProviderStatsTable rows={[row({ unpriced_count: 2 })]} names={{}} />,
     );
     expect(html).toContain("≥ $0.01000");
   });

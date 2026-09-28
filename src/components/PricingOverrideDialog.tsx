@@ -1,7 +1,28 @@
 import { useEffect, useState } from "react";
 import { PriceOverride, listPriceOverrides, setPriceOverride, deletePriceOverride } from "../lib/api";
+import { ProviderNames, providerLabel } from "../lib/providerName";
 
 const CUSTOM = "__custom__";
+
+/**
+ * 保存结果提示：repriced = 0 说明覆盖当前没有命中任何用量记录（琥珀警示），
+ * >0 显示重算条数（成功反馈）。
+ */
+export function SaveNotice({ repriced }: { repriced: number }) {
+  if (repriced === 0) {
+    return (
+      <div className="mb-3 text-sm text-amber-600">
+        已保存，但当前没有匹配的记录（请检查模型 ID 是否与用量记录一致）
+      </div>
+    );
+  }
+  return <div className="mb-3 text-sm text-green-600">已保存，已重算 {repriced} 条记录</div>;
+}
+
+/** 覆盖的命中记录数：0 = 覆盖未生效，红字警示。 */
+export function MatchedCount({ count }: { count: number }) {
+  return count === 0 ? <span className="text-red-600">{count}</span> : <span>{count}</span>;
+}
 
 /**
  * 校验四个单价：非空、有效数字、非负（允许 0）。
@@ -21,7 +42,7 @@ export function validatePrices(input: string, output: string, cacheRead: string,
 }
 
 export function PricingOverrideDialog(props: {
-  providers: string[]; onClose: () => void; onChanged: () => void;
+  providers: string[]; names: ProviderNames; onClose: () => void; onChanged: () => void;
   initialProvider?: string; initialModel?: string;
 }) {
   const [providerSel, setProviderSel] = useState(
@@ -39,6 +60,8 @@ export function PricingOverrideDialog(props: {
   const [cacheCreation, setCacheCreation] = useState("");
   const [rows, setRows] = useState<PriceOverride[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // 最近一次保存的重算条数（null = 尚未保存）
+  const [saveNotice, setSaveNotice] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirming, setConfirming] = useState<string | null>(null);
 
@@ -61,9 +84,10 @@ export function PricingOverrideDialog(props: {
     if (!modelId.trim()) { setError("请填写模型 ID"); return; }
     setSaving(true);
     try {
-      await setPriceOverride(providerId, modelId.trim(), input, output, cacheRead, cacheCreation);
+      const repriced = await setPriceOverride(providerId, modelId.trim(), input, output, cacheRead, cacheCreation);
       setModelId(""); setInput(""); setOutput(""); setCacheRead(""); setCacheCreation("");
       setError(null);
+      setSaveNotice(repriced);
       await load();
       props.onChanged();
     } catch (e) {
@@ -77,6 +101,7 @@ export function PricingOverrideDialog(props: {
     try {
       await deletePriceOverride(pid, mid);
       setError(null);
+      setSaveNotice(null);
       await load();
       props.onChanged();
     } catch (e) {
@@ -109,7 +134,11 @@ export function PricingOverrideDialog(props: {
             供应商
             <select value={providerSel} onChange={(e) => setProviderSel(e.target.value)}
               className="rounded border border-gray-300 px-2 py-1 text-sm text-gray-900">
-              {props.providers.map((p) => <option key={p} value={p}>{p}</option>)}
+              {props.providers.map((p) => (
+                <option key={p} value={p} title={props.names[p] != null ? p : undefined}>
+                  {providerLabel(props.names, p)}
+                </option>
+              ))}
               <option value={CUSTOM}>自定义</option>
             </select>
           </label>
@@ -140,6 +169,8 @@ export function PricingOverrideDialog(props: {
           </button>
         </div>
 
+        {saveNotice !== null && <SaveNotice repriced={saveNotice} />}
+
         {error && <div className="mb-3 text-sm text-red-600">{error}</div>}
 
         <div className="max-h-60 overflow-auto">
@@ -152,23 +183,27 @@ export function PricingOverrideDialog(props: {
                 <th className="py-2 pr-4 font-medium">输出</th>
                 <th className="py-2 pr-4 font-medium">缓存读取</th>
                 <th className="py-2 pr-4 font-medium">缓存创建</th>
+                <th className="py-2 pr-4 font-medium">命中记录数</th>
                 <th className="py-2 pr-4 font-medium"></th>
               </tr>
             </thead>
             <tbody>
               {rows.length === 0 && (
-                <tr><td colSpan={7} className="py-3 text-gray-500">暂无覆盖</td></tr>
+                <tr><td colSpan={8} className="py-3 text-gray-500">暂无覆盖</td></tr>
               )}
               {rows.map((r) => {
                 const key = `${r.provider_id}/${r.model_id}`;
                 return (
                   <tr key={key} className="border-b border-gray-100">
-                    <td className="py-2 pr-4">{r.provider_id || "(未指定)"}</td>
+                    <td className="py-2 pr-4" title={props.names[r.provider_id] != null ? r.provider_id : undefined}>
+                      {r.provider_id ? providerLabel(props.names, r.provider_id) : "(未指定)"}
+                    </td>
                     <td className="py-2 pr-4">{r.model_id}</td>
                     <td className="py-2 pr-4">{r.input}</td>
                     <td className="py-2 pr-4">{r.output}</td>
                     <td className="py-2 pr-4">{r.cache_read}</td>
                     <td className="py-2 pr-4">{r.cache_creation}</td>
+                    <td className="py-2 pr-4"><MatchedCount count={r.matched_count} /></td>
                     <td className="py-2 pr-4">
                       {confirming === key ? (
                         <span className="flex items-center gap-1">

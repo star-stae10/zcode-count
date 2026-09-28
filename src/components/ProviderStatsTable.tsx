@@ -1,7 +1,8 @@
 import { ProviderStat } from "../lib/api";
 import { formatTokens, formatCostWithUnpriced } from "../lib/format";
+import { ProviderNames, providerLabel } from "../lib/providerName";
 
-export function ProviderStatsTable({ rows }: { rows: ProviderStat[] }) {
+export function ProviderStatsTable({ rows, names }: { rows: ProviderStat[]; names: ProviderNames }) {
   return (
     <div className="overflow-auto px-4 py-3">
       <table className="w-full text-sm">
@@ -17,7 +18,9 @@ export function ProviderStatsTable({ rows }: { rows: ProviderStat[] }) {
         <tbody>
           {rows.map((r) => (
             <tr key={r.provider_id} className="border-b border-gray-100">
-              <td className="py-2 pr-4">{r.provider_id}</td>
+              <td className="py-2 pr-4" title={names[r.provider_id] != null ? r.provider_id : undefined}>
+                {providerLabel(names, r.provider_id)}
+              </td>
               <td className="py-2 pr-4">{r.request_count}</td>
               <td className="py-2 pr-4">{formatTokens(r.input_tokens)}</td>
               <td className="py-2 pr-4">{formatTokens(r.output_tokens)}</td>

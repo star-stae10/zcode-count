@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ModelSel, ProviderModelRow, ScopeFilter } from "../lib/api";
+import { ProviderNames } from "../lib/providerName";
 import { ScopeChips, ScopeGroup, ScopePicker, scopeSummary, toggleModel, toggleProvider } from "./ScopePicker";
 
 function toGroups(rows: ProviderModelRow[]): ScopeGroup[] {
@@ -23,6 +24,7 @@ function toGroups(rows: ProviderModelRow[]): ScopeGroup[] {
  */
 export function ScopeDialog(props: {
   providerModels: ProviderModelRow[];
+  names: ProviderNames;
   scope: ScopeFilter;
   onApply: (f: ScopeFilter) => void;
   onClose: () => void;
@@ -52,6 +54,7 @@ export function ScopeDialog(props: {
         <ScopePicker
           groups={groups}
           selected={draft}
+          names={props.names}
           onChange={(f) => setDraft(f)}
         />
 
@@ -59,6 +62,7 @@ export function ScopeDialog(props: {
         <div className="mt-2">
           <ScopeChips
             selected={draft}
+            names={props.names}
             onRemoveProvider={(p) => setDraft(toggleProvider(draft, p))}
             onRemoveModel={(m: ModelSel) => setDraft(toggleModel(draft, m.provider_id, m.model_id))}
             onClear={() => setDraft({ providers: [], models: [] })}

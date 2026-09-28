@@ -32,7 +32,7 @@ React UI  src/  （汇总卡 + 三页签：请求日志 / Provider 统计 / 模�
 
 ```
 src-tauri/src/
-├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 13 个命令）
+├─ lib.rs            # 模块注册 + Tauri Builder（setup 注入 OwnDb、invoke_handler 注册 14 个命令）
 ├─ commands.rs       # AppState、SyncStatus、13 个 Tauri 命令（统计 4 + 清除/审计 4 + 未定价/层级 2 + 定价覆盖 3）
 ├─ error.rs          # AppError（thiserror；实现 Serialize 供命令返回）
 ├─ db/
@@ -49,15 +49,18 @@ src-tauri/src/
 │  └─ table.rs       # PricingTable：load(只读) / from_rows / lookup(精确→前缀)
 └─ zcode/
    ├─ mod.rs         # zcode_db_path()
-   └─ sync.rs        # SyncReport（含 tombstoned 计数）、sync()：增量同步 + 墓碑过滤 + 自动重定价
+   ├─ provider_names.rs # 从 ZCode provider_config.json 读 (providerId → providerName/baseUrl)；缺失→空、损坏→Err、缺字段→跳过
+   └─ sync.rs        # SyncReport（含 tombstoned 计数）、sync()：增量同步 + 墓碑过滤 + 自动重定价 + 名称快照 upsert（在 mtime 短路之前）
 
 src/
 ├─ lib/api.ts        # invoke 封装 + 全部前端类型（字段 snake_case，与 Rust Serialize 对齐）
 ├─ lib/format.ts     # formatTokens/formatCost/formatCostWithUnpriced/formatTime/rangeToWindow/rangeLabel
 │                    #   + costConfidence（成本可信度）+ formatDateTime + dateStart/dateEndExclusive
+├─ lib/providerName.ts # providerLabel(names, id)：供应商显示名映射（无映射回退原始 ID）；显示用名称、传参/过滤一律仍用原始 provider_id
 ├─ components/       # Toolbar / SummaryCards / Tabs / RequestLogTable / ProviderStatsTable / ModelStatsTable
-│                    #   / PricingOverrideDialog（支持预填）/ ScopePicker（供应商>模型层级多选，核算与清除共用）
+│                    #   / PricingOverrideDialog（支持预填 + 命中数/重算反馈）/ ScopePicker（供应商>模型层级多选，核算与清除共用）
 │                    #   / ScopeDialog（核算范围）/ ClearDataDialog（清除流程）/ UnpricedDialog / AuditLogDialog
+│                    #   ——凡显示供应商处均接 names 映射（title 保留原始 ID）
 └─ App.tsx           # range/scope/tab/status/summary/logs/stats/unpriced state + refresh()（Promise.all 并行 + 请求序号防竞态）
 
 .github/workflows/build.yml   # Windows CI 构建
@@ -126,6 +129,10 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 12. **未定价警告与成本可信度**：`Summary` 含 `unpriced_tokens`（未定价行 input+output）与 `unpriced_models`（未定价 (provider, model) 组合数）。`unpriced_count > 0` 时 SummaryCards 显示琥珀色警告（文案明示"实际成本可能高于显示值"）+ 可信度（`format.ts::costConfidence`：未定价 token 占比 0% → 高 / <20% → 中 / 其余 → 低）。`UnpricedDialog` 明细来自 `get_unpriced_models`：按 (provider, model) 分组，估算区间 = 未定价 token × 同供应商已定价行的每 token 单价范围（`[min,max]`），无可参照行 → None（显示"无法估算"）。每行有「补充定价」按钮 → 打开 `PricingOverrideDialog` 并预填该组合。
 
+13. **供应商名称映射（展示层）**：`provider_names` 表在每次 sync 时从 ZCode `provider_config.json` 快照 upsert（**放在 mtime 短路之前**——provider 改名不改用量库；只增不删，provider 删除后历史数据仍可读；`source='manual'` 语义预留、sync 不覆盖它）。展示层一律 `providerLabel()` 显示名称、`title`/传参/过滤保留原始 `provider_id`；无映射回退原始 ID，配置缺失/损坏不阻断 sync 与刷新。统计与传参口径零改动。
+
+14. **覆盖匹配口径统一（单一规则源）**：`pricing::override_lookup` = 先 `(provider, model)` 精确、再按 `model_candidates` 归一化候选匹配，provider 恒精确、空候选覆盖跳过、精确优先。`resolve()` 内部改调它（签名不变）；sync 覆盖重算 pass（`list_models_for_provider` + `override_lookup` 判定命中）与删除覆盖清理（`delete_override_and_clear`）同口径。**禁止在别处另写匹配逻辑**——历史教训：覆盖曾用精确匹配而表价用归一化，同一规则被复制三份导致覆盖静默失效。`OverrideRow.matched_count` 也必须复用 `override_lookup` 计算。
+
 ## 5. 数据源 schema 速查
 
 **ZCode `model_usage`**（只读）：`id, provider_id, model_id, query_source, status, started_at(ms), completed_at, duration_ms, time_to_first_token_ms, input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, provider_total_tokens, computed_total_tokens, session_id, ...`
@@ -136,6 +143,7 @@ pnpm tauri build                                   # 打 Windows 安装包（慢
 
 **`sync_cursors`**：`source(PK, ZCode库路径), last_started_at, last_mtime, last_synced_at`
 **`pricing_overrides`**：`(provider_id, model_id)(PK) + 四个单价`（UI：工具栏「定价覆盖」弹窗）
+**`provider_names`**：`provider_id(PK), display_name, source('zcode_config'|'manual'), base_url, first_seen_at, updated_at`（sync 快照 upsert，只增不删）
 **`audit_log`**：`id, actor(操作人), action('clear_usage'), started_at_from/to(时间段,可 NULL), providers(JSON 数组), models(JSON 数组 [{provider_id,model_id}]), deleted_count, created_at`
 **`clear_tombstones`**：`id, ts_from, ts_to(闭区间,ms), provider_id(NULL=不限), model_id(NULL=该供应商下不限), created_at`
 

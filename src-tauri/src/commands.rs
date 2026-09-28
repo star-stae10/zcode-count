@@ -1,6 +1,7 @@
 use crate::db::dao::{self, ClearScope, ScopeFilter};
 use crate::db::OwnDb;
 use crate::pricing::{cc_switch_db_path, table::PricingTable};
+use crate::zcode::provider_names::{self, ProviderName};
 use crate::zcode::{sync::sync, zcode_db_path};
 use serde::Serialize;
 use std::sync::Mutex;
@@ -35,6 +36,19 @@ fn load_pricing() -> (PricingTable, bool) {
     }
 }
 
+/// 读取 ZCode provider 配置中的名称映射。
+/// 配置缺失/损坏一律降级为空列表（名称仅影响展示，绝不阻断 sync）。
+fn load_provider_names() -> Vec<ProviderName> {
+    let path = provider_names::provider_config_path();
+    match provider_names::load(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("读取 ZCode provider 配置失败（忽略名称映射）: {e}");
+            Vec::new()
+        }
+    }
+}
+
 /// 审计日志的「操作人」：单机工具，取本机 Windows 用户名。
 fn current_actor() -> String {
     std::env::var("USERNAME")
@@ -49,8 +63,10 @@ pub fn sync_usage(state: State<'_, Mutex<AppState>>) -> Result<SyncStatus, Strin
 
     let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
     let (pricing, pricing_found) = load_pricing();
+    let names = load_provider_names();
 
-    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides).map_err(|e| e.to_string())?;
+    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides, &names)
+        .map_err(|e| e.to_string())?;
     Ok(SyncStatus {
         zcode_found: report.zcode_found,
         pricing_found,
@@ -97,6 +113,14 @@ pub fn list_provider_models(state: State<'_, Mutex<AppState>>) -> Result<Vec<dao
     let app = state.lock().map_err(|e| e.to_string())?;
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
     dao::list_provider_models(&conn).map_err(|e| e.to_string())
+}
+
+/// 供应商名称映射（前端把 provider_id 显示为可读名称；无映射时回退原始 ID）。
+#[tauri::command]
+pub fn list_provider_names(state: State<'_, Mutex<AppState>>) -> Result<Vec<dao::ProviderNameRow>, String> {
+    let app = state.lock().map_err(|e| e.to_string())?;
+    let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
+    dao::list_provider_names(&conn).map_err(|e| e.to_string())
 }
 
 /// 未定价模型清单（含粗略成本估算区间）。
@@ -154,7 +178,9 @@ pub fn set_price_override(
     // 保存后立即重算：重读覆盖与定价表再同步。
     let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
     let (pricing, _) = load_pricing();
-    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides).map_err(|e| e.to_string())?;
+    let names = load_provider_names();
+    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides, &names)
+        .map_err(|e| e.to_string())?;
     Ok(report.repriced as u32)
 }
 
@@ -174,12 +200,13 @@ pub fn delete_price_override(
     let conn = app.db.conn.lock().map_err(|e| e.to_string())?;
     let provider_id = provider_id.trim();
     let model_id = model_id.trim();
-    dao::delete_override(&conn, provider_id, model_id).map_err(|e| e.to_string())?;
-    // 清掉该组合已按覆盖价定过的行（priced=0），使下方 sync 能按当前定价来源回填。
-    dao::clear_pricing_by_provider_model(&conn, provider_id, model_id).map_err(|e| e.to_string())?;
+    // 删除覆盖并按归一化口径清空其影响范围（避免「删了覆盖、成本还留着覆盖价」）。
+    dao::delete_override_and_clear(&conn, provider_id, model_id).map_err(|e| e.to_string())?;
 
     let overrides = dao::get_overrides(&conn).map_err(|e| e.to_string())?;
     let (pricing, _) = load_pricing();
-    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides).map_err(|e| e.to_string())?;
+    let names = load_provider_names();
+    let report = sync(&conn, &zcode_db_path(), &pricing, &overrides, &names)
+        .map_err(|e| e.to_string())?;
     Ok(report.repriced as u32)
 }

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ModelSel, ScopeFilter } from "../lib/api";
+import { ProviderNames, providerLabel } from "../lib/providerName";
 
 /** 层级选择器数据源：供应商及其全部模型。 */
 export interface ScopeGroup {
@@ -58,8 +59,9 @@ export function ScopePicker(props: {
   groups: ScopeGroup[];
   selected: ScopeFilter;
   onChange: (f: ScopeFilter) => void;
+  names: ProviderNames;
 }) {
-  const { groups, selected, onChange } = props;
+  const { groups, selected, onChange, names } = props;
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   if (groups.length === 0) {
@@ -85,7 +87,10 @@ export function ScopePicker(props: {
                   checked={providerChecked}
                   onChange={() => onChange(toggleProvider(selected, g.provider_id))}
                 />
-                <span className="font-medium">{g.provider_id}</span>
+                {/* 显示名称（无映射回退 ID）；勾选/回调值仍是原始 provider_id */}
+                <span className="font-medium" title={names[g.provider_id] != null ? g.provider_id : undefined}>
+                  {providerLabel(names, g.provider_id)}
+                </span>
                 <span className="text-xs text-gray-400">全部模型</span>
               </label>
               {modelSel > 0 && (
@@ -123,26 +128,29 @@ export function ScopePicker(props: {
   );
 }
 
-/** 已选范围 chips（含单个移除与整体清除）。 */
+/** 已选范围 chips（含单个移除与整体清除）。显示名称，移除回调仍传原始 provider_id。 */
 export function ScopeChips(props: {
   selected: ScopeFilter;
+  names: ProviderNames;
   onRemoveProvider: (p: string) => void;
   onRemoveModel: (m: ModelSel) => void;
   onClear: () => void;
 }) {
-  const { selected } = props;
+  const { selected, names } = props;
   if (selected.providers.length === 0 && selected.models.length === 0) return null;
   return (
     <div className="flex flex-wrap items-center gap-1">
       {selected.providers.map((p) => (
-        <span key={`p-${p}`} className="flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
-          {p}（全部模型）
-          <button type="button" onClick={() => props.onRemoveProvider(p)} className="text-blue-400 hover:text-blue-700" aria-label={`移除 ${p}`}>×</button>
+        <span key={`p-${p}`} title={names[p] != null ? p : undefined}
+          className="flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
+          {providerLabel(names, p)}（全部模型）
+          <button type="button" onClick={() => props.onRemoveProvider(p)} className="text-blue-400 hover:text-blue-700" aria-label={`移除 ${providerLabel(names, p)}`}>×</button>
         </span>
       ))}
       {selected.models.map((m) => (
-        <span key={`m-${m.provider_id}/${m.model_id}`} className="flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
-          {m.provider_id} › {m.model_id}
+        <span key={`m-${m.provider_id}/${m.model_id}`} title={names[m.provider_id] != null ? m.provider_id : undefined}
+          className="flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-700">
+          {providerLabel(names, m.provider_id)} › {m.model_id}
           <button type="button" onClick={() => props.onRemoveModel(m)} className="text-blue-400 hover:text-blue-700" aria-label={`移除 ${m.model_id}`}>×</button>
         </span>
       ))}

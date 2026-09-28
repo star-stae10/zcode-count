@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ClearDataDialog, validateClearForm } from "./ClearDataDialog";
+import { ClearDataDialog, ModelList, validateClearForm } from "./ClearDataDialog";
 
 describe("validateClearForm", () => {
   it("passes when time range is not enabled", () => {
@@ -21,7 +21,7 @@ describe("validateClearForm", () => {
 describe("ClearDataDialog rendering", () => {
   it("labels the danger, distinguishes from scope filtering and guards full clear", () => {
     const html = renderToStaticMarkup(
-      <ClearDataDialog providerModels={[]} onClose={() => {}} onDone={() => {}} onOpenAudit={() => {}} />,
+      <ClearDataDialog providerModels={[]} names={{}} onClose={() => {}} onDone={() => {}} onOpenAudit={() => {}} />,
     );
     expect(html).toContain("清除用量数据（永久删除，不可恢复）");
     expect(html).toContain("与「核算范围」不同：核算范围只影响展示，不删除数据");
@@ -34,9 +34,30 @@ describe("ClearDataDialog rendering", () => {
 
   it("shows preview step UI only after preview (no confirm input initially)", () => {
     const html = renderToStaticMarkup(
-      <ClearDataDialog providerModels={[]} onClose={() => {}} onDone={() => {}} onOpenAudit={() => {}} />,
+      <ClearDataDialog providerModels={[]} names={{}} onClose={() => {}} onDone={() => {}} onOpenAudit={() => {}} />,
     );
     expect(html).toContain("预览将删除的数据");
     expect(html).not.toContain("以授权");
+  });
+});
+
+describe("ModelList (clear scope model list)", () => {
+  it("shows mapped provider names with raw provider_id kept in title", () => {
+    const html = renderToStaticMarkup(
+      <ModelList names={{ "new-provider": "OpenCode Go" }} models={[{ provider_id: "new-provider", model_id: "m1" }]} />,
+    );
+    expect(html).toContain("OpenCode Go › m1");
+    expect(html).toContain('title="new-provider"');
+    expect(html).not.toContain(">new-provider<");
+  });
+
+  it("falls back to raw ids without title when unmapped; empty list shows the unbounded copy", () => {
+    const html = renderToStaticMarkup(
+      <ModelList names={{}} models={[{ provider_id: "p1", model_id: "m1" }]} />,
+    );
+    expect(html).toContain("p1 › m1");
+    expect(html).not.toContain("title=");
+    const none = renderToStaticMarkup(<ModelList names={{}} models={[]} />);
+    expect(none).toContain("不限（所选供应商的全部模型）");
   });
 });

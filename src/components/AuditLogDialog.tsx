@@ -1,9 +1,32 @@
 import { useEffect, useState } from "react";
-import { AuditLogRow, listAuditLogs } from "../lib/api";
+import { AuditLogRow, ModelSel, listAuditLogs } from "../lib/api";
 import { formatDateTime } from "../lib/format";
+import { ProviderNames, hasAnyName, providerLabel, providerListLabel } from "../lib/providerName";
+
+/** 审计行的供应商列：显示名称（无映射回退 ID）；存在映射时 title 保留原始 ID 列表。 */
+export function ProviderCell(props: { names: ProviderNames; providers: string[] }) {
+  const hasMap = hasAnyName(props.names, props.providers);
+  return (
+    <td className="py-2 pr-4 text-xs" title={hasMap ? props.providers.join("、") : undefined}>
+      {providerListLabel(props.names, props.providers, "全部")}
+    </td>
+  );
+}
+
+/** 审计行的模型列：供应商显示名称；存在映射时 title 保留原始「provider_id › model_id」列表。 */
+export function ModelCell(props: { names: ProviderNames; models: ModelSel[] }) {
+  const hasMap = hasAnyName(props.names, props.models.map((m) => m.provider_id));
+  return (
+    <td className="py-2 pr-4 text-xs" title={hasMap ? props.models.map((m) => `${m.provider_id} › ${m.model_id}`).join("、") : undefined}>
+      {props.models.length > 0
+        ? props.models.map((m) => `${providerLabel(props.names, m.provider_id)} › ${m.model_id}`).join("、")
+        : "全部模型"}
+    </td>
+  );
+}
 
 /** 审计日志（清除类操作的历史：操作人 / 时间 / 范围 / 删除量）。 */
-export function AuditLogDialog(props: { onClose: () => void }) {
+export function AuditLogDialog(props: { names: ProviderNames; onClose: () => void }) {
   const [rows, setRows] = useState<AuditLogRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -55,12 +78,8 @@ export function AuditLogDialog(props: { onClose: () => void }) {
                       ? `${r.started_at_from != null ? formatDateTime(r.started_at_from) : "最早"} ~ ${r.started_at_to != null ? formatDateTime(r.started_at_to) : "最新"}`
                       : "全部时间"}
                   </td>
-                  <td className="py-2 pr-4 text-xs">{r.providers.length > 0 ? r.providers.join("、") : "全部"}</td>
-                  <td className="py-2 pr-4 text-xs">
-                    {r.models.length > 0
-                      ? r.models.map((m) => `${m.provider_id} › ${m.model_id}`).join("、")
-                      : "全部模型"}
-                  </td>
+                  <ProviderCell names={props.names} providers={r.providers} />
+                  <ModelCell names={props.names} models={r.models} />
                   <td className="py-2 pr-4">{r.deleted_count}</td>
                 </tr>
               ))}

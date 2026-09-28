@@ -1,6 +1,9 @@
 use crate::db::dao::{self, UsageRecord};
 use crate::error::AppError;
-use crate::pricing::{cost::calculate_cache_inclusive, resolve, table::PricingTable, ModelPricing};
+use crate::pricing::{
+    cost::calculate_cache_inclusive, override_lookup, resolve, table::PricingTable, ModelPricing,
+};
+use crate::zcode::provider_names::ProviderName;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -47,7 +50,17 @@ pub fn sync(
     zcode_path: &Path,
     pricing: &PricingTable,
     overrides: &HashMap<(String, String), ModelPricing>,
+    names: &[ProviderName],
 ) -> Result<SyncReport, AppError> {
+    // 供应商名称快照：必须在 mtime 短路判断之前执行——provider 改名/新增不会
+    // 改动 ZCode 用量库（mtime 不变），放在短路之后名称就永远不会更新。
+    // 名称写入失败不阻断 sync（降级忽略：名称仅影响展示，不影响统计与成本）。
+    if !names.is_empty() {
+        if let Err(e) = dao::upsert_provider_names(conn, names) {
+            eprintln!("供应商名称快照写入失败（已忽略）: {e}");
+        }
+    }
+
     if !zcode_path.exists() {
         return Ok(SyncReport { zcode_found: false, ..Default::default() });
     }
@@ -135,19 +148,30 @@ pub fn sync(
     }
 
     // 重定价 pass（不受 mtime 短路影响：定价来源独立于 ZCode 文件）。
-    // (a) 覆盖重算：对每个覆盖的 (provider, model)，重算该组合的**所有**行（含已定价）。
+    // (a) 覆盖重算：对每个覆盖供应商，取其全部 DISTINCT model_id，用与 resolve
+    //     相同的 override_lookup（归一化口径）判定命中后，重算命中组合的**所有**行。
+    //     不再用「精确 (provider, model) SQL 直接取行」——否则覆盖键为裸名、
+    //     记录为命名空间名时（如 deepseek-ai/DeepSeek-V4.1-flash）会静默漏算。
     if !overrides.is_empty() {
-        for ((provider_id, model_id), p) in overrides {
-            for r in dao::query_records_by_provider_model(conn, provider_id, model_id)? {
-                let c = calculate_cache_inclusive(
-                    r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens, p);
-                dao::update_record_pricing(
-                    conn, &r.request_id,
-                    &c.input_cost.to_string(), &c.output_cost.to_string(),
-                    &c.cache_read_cost.to_string(), &c.cache_creation_cost.to_string(),
-                    &c.total_cost.to_string(),
-                )?;
-                report.repriced += 1;
+        let mut providers: Vec<&String> = overrides.keys().map(|(p, _)| p).collect();
+        providers.sort();
+        providers.dedup();
+        for provider_id in providers {
+            for model_id in dao::list_models_for_provider(conn, provider_id)? {
+                let Some(p) = override_lookup(provider_id, &model_id, overrides) else {
+                    continue;
+                };
+                for r in dao::query_records_by_provider_model(conn, provider_id, &model_id)? {
+                    let c = calculate_cache_inclusive(
+                        r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens, &p);
+                    dao::update_record_pricing(
+                        conn, &r.request_id,
+                        &c.input_cost.to_string(), &c.output_cost.to_string(),
+                        &c.cache_read_cost.to_string(), &c.cache_creation_cost.to_string(),
+                        &c.total_cost.to_string(),
+                    )?;
+                    report.repriced += 1;
+                }
             }
         }
     }
@@ -271,11 +295,11 @@ mod tests {
         migrate(&conn).unwrap();
         let overrides = HashMap::new();
 
-        let r1 = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let r1 = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(r1.imported, 2);
         assert_eq!(r1.unpriced, 0);
 
-        let r2 = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let r2 = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(r2.imported, 0); // 幂等
 
         let logs = crate::db::dao::query_logs(&conn, 0, 1000, None, 100).unwrap();
@@ -293,7 +317,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         let r = sync(&conn, std::path::Path::new("C:/definitely/not/here.sqlite"),
-                     &PricingTable::from_rows(vec![]), &HashMap::new()).unwrap();
+                     &PricingTable::from_rows(vec![]), &HashMap::new(), &[]).unwrap();
         assert!(!r.zcode_found);
         assert_eq!(r.imported, 0);
     }
@@ -333,7 +357,7 @@ mod tests {
         migrate(&conn).unwrap();
         let overrides = HashMap::new();
 
-        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let first = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.last_started_at, 100);
 
@@ -347,7 +371,7 @@ mod tests {
         insert_usage(&zpath, "c", 200);
         assert_ne!(max_mtime(&zpath), cursor_mtime, "mtime 未变化，测试前提不成立");
 
-        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let second = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(second.imported, 2); // b（同毫秒）与 c 都必须导入
         let logs = crate::db::dao::query_logs(&conn, 0, 1000, None, 100).unwrap();
         assert_eq!(logs.len(), 3);
@@ -373,7 +397,7 @@ mod tests {
         migrate(&conn).unwrap();
         let overrides = HashMap::new();
 
-        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let first = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.last_started_at, first_started);
 
@@ -385,7 +409,7 @@ mod tests {
         insert_usage(&zpath, "late", first_started - 3 * DAY);
         assert_ne!(max_mtime(&zpath), cursor_mtime, "mtime 未变化，测试前提不成立");
 
-        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let second = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert!(second.imported >= 1, "早于水位线的迟到行必须被导入，imported={}", second.imported);
         let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
         assert!(logs.iter().any(|l| l.request_id == "late"), "query_logs 应能查到迟到行");
@@ -410,7 +434,7 @@ mod tests {
 
         // 第一次：无定价表 → 行 priced=0
         let empty = PricingTable::from_rows(vec![]);
-        let first = sync(&conn, &zpath, &empty, &overrides).unwrap();
+        let first = sync(&conn, &zpath, &empty, &overrides, &[]).unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.unpriced, 1);
 
@@ -420,7 +444,7 @@ mod tests {
         assert_eq!(b.total_cost_usd, "0");
 
         // 第二次：定价可用；ZCode 库未变化（mtime 短路），重定价仍须执行。
-        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let second = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(second.repriced, 1, "应重定价 1 行");
 
         let after = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
@@ -459,7 +483,7 @@ mod tests {
         ]);
 
         // 第一次：无覆盖 → 全部按表定价
-        let first = sync(&conn, &zpath, &table, &HashMap::new()).unwrap();
+        let first = sync(&conn, &zpath, &table, &HashMap::new(), &[]).unwrap();
         assert_eq!(first.imported, 3);
         let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
         let cost = |id: &str| Decimal::from_str(
@@ -474,7 +498,7 @@ mod tests {
             ("p1".to_string(), "m1".to_string()),
             ModelPricing { input: Decimal::from_str("1.0").unwrap(), ..pricing_zero() },
         );
-        let second = sync(&conn, &zpath, &table, &overrides).unwrap();
+        let second = sync(&conn, &zpath, &table, &overrides, &[]).unwrap();
         assert_eq!(second.repriced, 2, "该组合 2 行（含已定价行）都应重算");
 
         let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
@@ -490,7 +514,7 @@ mod tests {
             ("p1".to_string(), "m1".to_string()),
             ModelPricing { input: Decimal::from_str("2.0").unwrap(), ..pricing_zero() },
         );
-        let third = sync(&conn, &zpath, &PricingTable::from_rows(vec![]), &overrides2).unwrap();
+        let third = sync(&conn, &zpath, &PricingTable::from_rows(vec![]), &overrides2, &[]).unwrap();
         assert_eq!(third.repriced, 2, "空定价表 + 有覆盖也必须重算");
         let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
         let cost = |id: &str| Decimal::from_str(
@@ -531,7 +555,7 @@ mod tests {
             dao::set_override(&conn, "p1", m, &p).unwrap();
             overrides.insert(("p1".to_string(), m.to_string()), p);
         }
-        let first = sync(&conn, &zpath, &table, &overrides).unwrap();
+        let first = sync(&conn, &zpath, &table, &overrides, &[]).unwrap();
         assert_eq!(first.imported, 3);
         let cost = |id: &str| {
             let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
@@ -544,15 +568,14 @@ mod tests {
             assert_eq!(c, Decimal::from_str("0.001").unwrap(), "{id} 应为覆盖价");
         }
 
-        // 删除 (p1,m1) 与 (p1,m2) 的覆盖，并清空其成本后重新同步；保留 (p1,m3)。
+        // 删除 (p1,m1) 与 (p1,m2) 的覆盖（按归一化口径清理成本）后重新同步；保留 (p1,m3)。
         for m in ["m1", "m2"] {
-            dao::delete_override(&conn, "p1", m).unwrap();
-            let n = dao::clear_pricing_by_provider_model(&conn, "p1", m).unwrap();
+            let n = dao::delete_override_and_clear(&conn, "p1", m).unwrap();
             assert_eq!(n, 1, "组合 (p1,{m}) 应清空 1 行");
         }
         let remaining = dao::get_overrides(&conn).unwrap();
         assert_eq!(remaining.len(), 1, "只剩 (p1,m3) 覆盖");
-        let second = sync(&conn, &zpath, &table, &remaining).unwrap();
+        let second = sync(&conn, &zpath, &table, &remaining, &[]).unwrap();
         assert_eq!(second.repriced, 2, "r1 回填表价 + r2 保持未定价不计数；仅 r1 计入");
 
         // 表里有价 → 回退表价
@@ -591,11 +614,11 @@ mod tests {
         migrate(&conn).unwrap();
         let overrides = HashMap::new();
 
-        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let first = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(first.scanned, 2);
         assert_eq!(first.imported, 2);
 
-        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let second = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(second.scanned, 0); // 短路
         assert_eq!(second.imported, 0);
         assert_eq!(second.last_started_at, 200);
@@ -620,7 +643,7 @@ mod tests {
         migrate(&conn).unwrap();
         let overrides = HashMap::new();
 
-        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let first = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(first.imported, 1);
 
         let src = zpath.to_string_lossy().to_string();
@@ -633,7 +656,7 @@ mod tests {
         drop(c);
         assert_ne!(max_mtime(&zpath), cursor_mtime, "mtime 未变化，测试前提不成立");
 
-        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let second = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(second.scanned, 1); // 确实走了查询/插入路径
         assert_eq!(second.imported, 0); // 重复 request_id 未再导入
         assert_eq!(second.skipped, 1);
@@ -661,7 +684,7 @@ mod tests {
         migrate(&conn).unwrap();
         let overrides = HashMap::new();
 
-        let first = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let first = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(first.imported, 2);
 
         // 清除 p1 在 [0, 6*DAY] 的数据（命中 gone），写墓碑
@@ -684,7 +707,7 @@ mod tests {
             "mtime 未变化，测试前提不成立"
         );
 
-        let second = sync(&conn, &zpath, &table(), &overrides).unwrap();
+        let second = sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
         assert_eq!(second.tombstoned, 1, "重叠窗口内的已删行必须被墓碑过滤");
         assert_eq!(second.imported, 1, "只有区间外的新行被导入");
 
@@ -717,5 +740,124 @@ mod tests {
 
         let _ = std::fs::remove_file(&zpath);
         let _ = std::fs::remove_file(&wal);
+    }
+
+    // -- P1-A：供应商名称快照 -------------------------------------------------
+
+    fn pname(id: &str, name: &str) -> ProviderName {
+        ProviderName {
+            provider_id: id.into(),
+            display_name: name.into(),
+            base_url: None,
+        }
+    }
+
+    /// 关键回归点：provider 改名不会改 ZCode 用量库 mtime——第二次 sync 走
+    /// mtime 短路时，名称快照仍必须写入/更新（upsert 在短路判断之前执行）。
+    #[test]
+    fn provider_names_upserted_even_when_mtime_short_circuits() {
+        let dir = std::env::temp_dir().join(format!("zc-test-pname-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        insert_usage(&zpath, "a", 100);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let overrides = HashMap::new();
+
+        let first = sync(&conn, &zpath, &table(), &overrides, &[pname("p1", "Old Name")]).unwrap();
+        assert_eq!(first.imported, 1);
+        let rows = dao::list_provider_names(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].display_name, "Old Name");
+
+        // ZCode 库未变（mtime 短路），但 provider 改名 → 名称必须更新
+        let second = sync(&conn, &zpath, &table(), &overrides, &[pname("p1", "New Name")]).unwrap();
+        assert_eq!(second.scanned, 0, "测试前提：本次确实走了 mtime 短路");
+        let rows = dao::list_provider_names(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "只增不删：改名 upsert 不应产生新行");
+        assert_eq!(rows[0].display_name, "New Name", "短路时改名仍必须生效");
+
+        // 名称来源中消失的 provider 不会被删除（只增不删）
+        sync(&conn, &zpath, &table(), &overrides, &[]).unwrap();
+        let rows = dao::list_provider_names(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "空名称列表不得删除既有快照");
+
+        let _ = std::fs::remove_file(&zpath);
+    }
+
+    /// provider 配置 JSON 损坏 → load 返回 Err，调用方降级为空名称列表，
+    /// sync 照常工作（名称读取失败不阻断同步）。
+    #[test]
+    fn broken_provider_config_does_not_block_sync() {
+        let dir = std::env::temp_dir().join(format!("zc-test-bcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        insert_usage(&zpath, "a", 100);
+
+        let cfg = dir.join("provider_config.json");
+        std::fs::write(&cfg, "{ broken json !!!").unwrap();
+
+        let loaded = crate::zcode::provider_names::load(&cfg);
+        assert!(loaded.is_err(), "损坏配置应返回 Err（由调用方降级）");
+        let names: Vec<ProviderName> = loaded.unwrap_or_default(); // commands 层的降级路径
+        assert!(names.is_empty());
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let r = sync(&conn, &zpath, &table(), &HashMap::new(), &names).unwrap();
+        assert_eq!(r.imported, 1, "名称读取失败不得阻断同步");
+        assert!(dao::list_provider_names(&conn).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&zpath);
+        let _ = std::fs::remove_file(&cfg);
+    }
+
+    /// 覆盖键为裸名、记录为命名空间名（同一物理供应商新旧 ID 的真实形态）：
+    /// 覆盖重算必须按归一化口径命中，金额按覆盖价。
+    #[test]
+    fn override_reprices_via_normalized_matching() {
+        let dir = std::env::temp_dir().join(format!("zc-test-novr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zpath = dir.join("db.sqlite");
+        let _ = std::fs::remove_file(&zpath);
+        create_usage_table(&zpath);
+        {
+            let c = rusqlite::Connection::open(&zpath).unwrap();
+            c.execute(
+                "INSERT INTO model_usage VALUES
+                 ('r1','p1','deepseek-ai/DeepSeek-V4.1-flash','completed',100,0,0,1000,0,0,0,0,'s1','main_turn')",
+                [],
+            ).unwrap();
+        }
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // 第一次：表价无此模型 → 未定价
+        let empty = PricingTable::from_rows(vec![]);
+        let first = sync(&conn, &zpath, &empty, &HashMap::new(), &[]).unwrap();
+        assert_eq!(first.unpriced, 1);
+
+        // 第二次：覆盖键为裸名 → 命名空间记录必须被重算为覆盖价
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            ("p1".to_string(), "deepseek-v4.1-flash".to_string()),
+            ModelPricing { input: Decimal::from_str("0.15").unwrap(), ..pricing_zero() },
+        );
+        let second = sync(&conn, &zpath, &empty, &overrides, &[]).unwrap();
+        assert_eq!(second.repriced, 1, "覆盖重算必须按归一化口径命中命名空间记录");
+
+        let logs = crate::db::dao::query_logs(&conn, 0, i64::MAX, None, 100).unwrap();
+        let r = logs.iter().find(|l| l.request_id == "r1").unwrap();
+        assert!(r.priced);
+        // input=1000, cache=0 → 1000 * 0.15 / 1e6 = 0.00015
+        assert_eq!(r.total_cost_usd, "0.00015", "金额必须按覆盖价计算");
+
+        let _ = std::fs::remove_file(&zpath);
     }
 }

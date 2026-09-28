@@ -1,3 +1,4 @@
+pub mod provider_names;
 pub mod sync;
 
 use std::path::PathBuf;

@@ -4,6 +4,7 @@ import {
   clearUsage, previewClearUsage,
 } from "../lib/api";
 import { dateEndExclusive, dateStart, formatDateTime } from "../lib/format";
+import { ProviderNames, hasAnyName, providerLabel, providerListLabel } from "../lib/providerName";
 import { ScopeGroup, ScopePicker, scopeSummary } from "./ScopePicker";
 
 function toGroups(rows: ProviderModelRow[]): ScopeGroup[] {
@@ -29,6 +30,20 @@ export function validateClearForm(useTime: boolean, sinceDate: string, untilDate
   return null;
 }
 
+/** 清除范围内的模型列表：供应商显示名称（有映射时 title 保留原始 provider_id）。 */
+export function ModelList(props: { names: ProviderNames; models: ModelSel[] }) {
+  if (props.models.length === 0) return <span className="text-gray-500">不限（所选供应商的全部模型）</span>;
+  return (
+    <ul className="ml-4 list-disc">
+      {props.models.map((m) => (
+        <li key={`${m.provider_id}/${m.model_id}`} title={props.names[m.provider_id] != null ? m.provider_id : undefined}>
+          {providerLabel(props.names, m.provider_id)} › {m.model_id}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 /**
  * 清除用量数据弹窗（危险操作）：选择范围 → 预览将删除的数据 → 输入授权确认短语 →
  * 永久删除 → 结果反馈与审计入口。
@@ -36,6 +51,7 @@ export function validateClearForm(useTime: boolean, sinceDate: string, untilDate
  */
 export function ClearDataDialog(props: {
   providerModels: ProviderModelRow[];
+  names: ProviderNames;
   onClose: () => void;
   onDone: () => void;        // 清除成功后关闭并刷新数据
   onOpenAudit: () => void;   // 查看审计记录
@@ -107,14 +123,7 @@ export function ClearDataDialog(props: {
   }
 
   function renderModelList(models: ModelSel[]) {
-    if (models.length === 0) return <span className="text-gray-500">不限（所选供应商的全部模型）</span>;
-    return (
-      <ul className="ml-4 list-disc">
-        {models.map((m) => (
-          <li key={`${m.provider_id}/${m.model_id}`}>{m.provider_id} › {m.model_id}</li>
-        ))}
-      </ul>
-    );
+    return <ModelList names={props.names} models={models} />;
   }
 
   return (
@@ -136,7 +145,11 @@ export function ClearDataDialog(props: {
               <div className="mt-1">影响的时间范围：{result.affected_since != null && result.affected_until != null
                 ? `${formatDateTime(result.affected_since)} ~ ${formatDateTime(result.affected_until)}`
                 : "（未知）"}</div>
-              <div>影响的供应商：{result.affected_providers.length > 0 ? result.affected_providers.join("、") : "（全部）"}</div>
+              <div
+                title={hasAnyName(props.names, result.affected_providers) ? result.affected_providers.join("、") : undefined}
+              >
+                影响的供应商：{providerListLabel(props.names, result.affected_providers, "（全部）")}
+              </div>
               <div>影响的模型：</div>
               {renderModelList(result.affected_models)}
               <div className="mt-1">已写入审计日志（记录 #{result.audit_id}）。</div>
@@ -171,6 +184,7 @@ export function ClearDataDialog(props: {
             <ScopePicker
               groups={groups}
               selected={draft}
+              names={props.names}
               onChange={(f) => { setDraft(f); invalidatePreview(); }}
             />
 
@@ -195,7 +209,12 @@ export function ClearDataDialog(props: {
                     ? `${preview.since != null ? formatDateTime(preview.since) : "最早"} ~ ${preview.until != null ? formatDateTime(preview.until) : "最新"}`
                     : "全部时间"}
                 </div>
-                <div className="text-gray-700">供应商范围：{preview.providers.length > 0 ? preview.providers.join("、") : "全部供应商"}</div>
+                <div
+                  className="text-gray-700"
+                  title={hasAnyName(props.names, preview.providers) ? preview.providers.join("、") : undefined}
+                >
+                  供应商范围：{providerListLabel(props.names, preview.providers, "全部供应商")}
+                </div>
                 <div className="text-gray-700">模型范围：{renderModelList(preview.models)}</div>
                 <div className="mt-2 flex items-center gap-2">
                   <input

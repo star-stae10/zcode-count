@@ -1,9 +1,10 @@
 import { RequestLogRow } from "../lib/api";
 import { formatCost, formatTime } from "../lib/format";
+import { ProviderNames, providerLabel } from "../lib/providerName";
 
 const COLS = ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "用时/首字", "状态", "来源"];
 
-export function RequestLogTable({ rows }: { rows: RequestLogRow[] }) {
+export function RequestLogTable({ rows, names }: { rows: RequestLogRow[]; names: ProviderNames }) {
   return (
     <div className="overflow-auto px-4 py-3">
       <table className="w-full text-sm">
@@ -16,7 +17,9 @@ export function RequestLogTable({ rows }: { rows: RequestLogRow[] }) {
           {rows.map((r) => (
             <tr key={r.request_id} className="border-b border-gray-100">
               <td className="py-2 pr-4 whitespace-nowrap">{formatTime(r.started_at)}</td>
-              <td className="py-2 pr-4">{r.provider_id}</td>
+              <td className="py-2 pr-4" title={names[r.provider_id] != null ? r.provider_id : undefined}>
+                {providerLabel(names, r.provider_id)}
+              </td>
               <td className="py-2 pr-4">{r.model_id}</td>
               <td className="py-2 pr-4">
                 <div>{r.input_tokens.toLocaleString()}</div>

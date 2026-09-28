@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import {
   syncUsage, getSummary, listLogs, getProviderStats, getModelStats,
-  listProviderModels, getUnpricedModels,
+  listProviderModels, getUnpricedModels, listProviderNames,
   Summary, SyncStatus, RequestLogRow, ProviderStat, ModelStat,
-  ProviderModelRow, UnpricedModelRow, ScopeFilter,
+  ProviderModelRow, UnpricedModelRow, ScopeFilter, ProviderNameRow,
 } from "./lib/api";
 import { Range, rangeToWindow } from "./lib/format";
+import { ProviderNames } from "./lib/providerName";
 import { Toolbar } from "./components/Toolbar";
 import { SummaryCards } from "./components/SummaryCards";
 import { Tabs, TabId } from "./components/Tabs";
@@ -40,6 +41,8 @@ export default function App() {
   const [providerStats, setProviderStats] = useState<ProviderStat[]>([]);
   const [providerOptions, setProviderOptions] = useState<string[]>([]);
   const [providerModels, setProviderModels] = useState<ProviderModelRow[]>([]);
+  // 供应商显示名称映射（provider_id → 名称）；仅用于展示，筛选/传参仍用原始 ID
+  const [providerNames, setProviderNames] = useState<ProviderNames>({});
   const [modelStats, setModelStats] = useState<ModelStat[]>([]);
   const [unpricedRows, setUnpricedRows] = useState<UnpricedModelRow[]>([]);
   const [unpricedLoading, setUnpricedLoading] = useState(false);
@@ -64,7 +67,7 @@ export default function App() {
       setStatus(st);
       const { since, until } = rangeToWindow(range, customSince, customUntil);
       const scopeParam = scope.providers.length > 0 || scope.models.length > 0 ? scope : null;
-      const [sum, logRows, provRows, modelRows, unpr, allProvRows, pmRows] = await Promise.all([
+      const [sum, logRows, provRows, modelRows, unpr, allProvRows, pmRows, nameRows] = await Promise.all([
         getSummary(since, until, scopeParam),
         listLogs(since, until, scopeParam, 500),
         getProviderStats(since, until, scopeParam),
@@ -75,6 +78,8 @@ export default function App() {
           ? getProviderStats(since, until, null)
           : Promise.resolve(null as ProviderStat[] | null),
         listProviderModels(),
+        // 名称映射仅供展示；拉取失败降级为空映射（显示回退原始 ID，不阻断刷新）
+        listProviderNames().catch(() => [] as ProviderNameRow[]),
       ]);
       if (seq !== refreshSeq.current) return;
       setSummary(sum);
@@ -84,6 +89,7 @@ export default function App() {
       setUnpricedRows(unpr);
       setProviderOptions((allProvRows ?? provRows).map((p) => p.provider_id));
       setProviderModels(pmRows);
+      setProviderNames(Object.fromEntries(nameRows.map((n) => [n.provider_id, n.display_name])));
       setError(null);
     } catch (e) {
       if (seq === refreshSeq.current) {
@@ -128,6 +134,7 @@ export default function App() {
         range={range} onRange={setRange}
         status={status} onRefresh={refresh} loading={loading}
         scope={scope}
+        names={providerNames}
         onOpenScope={() => setScopeOpen(true)}
         onRemoveScopeProvider={(p) => setScope(toggleProvider(scope, p))}
         onRemoveScopeModel={(m) => setScope(toggleModel(scope, m.provider_id, m.model_id))}
@@ -140,6 +147,7 @@ export default function App() {
       {scopeOpen && (
         <ScopeDialog
           providerModels={providerModels}
+          names={providerNames}
           scope={scope}
           onApply={setScope}
           onClose={() => setScopeOpen(false)}
@@ -148,17 +156,19 @@ export default function App() {
       {clearOpen && (
         <ClearDataDialog
           providerModels={providerModels}
+          names={providerNames}
           onClose={() => setClearOpen(false)}
           onDone={() => { setClearOpen(false); void refresh(); }}
           onOpenAudit={() => { setClearOpen(false); setAuditOpen(true); }}
         />
       )}
-      {auditOpen && <AuditLogDialog onClose={() => setAuditOpen(false)} />}
+      {auditOpen && <AuditLogDialog names={providerNames} onClose={() => setAuditOpen(false)} />}
       {unpricedOpen && (
         <UnpricedDialog
           rows={unpricedRows}
           loading={unpricedLoading}
           error={unpricedError}
+          names={providerNames}
           onPriceModel={priceUnpricedModel}
           onClose={() => setUnpricedOpen(false)}
         />
@@ -166,6 +176,7 @@ export default function App() {
       {pricingOpen && (
         <PricingOverrideDialog
           providers={providerOptions}
+          names={providerNames}
           initialProvider={pricingInitial.provider}
           initialModel={pricingInitial.model}
           onClose={() => setPricingOpen(false)}
@@ -179,8 +190,8 @@ export default function App() {
         onOpenPricing={() => { setPricingInitial({}); setPricingOpen(true); }}
       />
       <Tabs active={tab} onChange={setTab} />
-      {tab === "logs" && <RequestLogTable rows={logs} />}
-      {tab === "providers" && <ProviderStatsTable rows={providerStats} />}
+      {tab === "logs" && <RequestLogTable rows={logs} names={providerNames} />}
+      {tab === "providers" && <ProviderStatsTable rows={providerStats} names={providerNames} />}
       {tab === "models" && <ModelStatsTable rows={modelStats} summary={summary} />}
     </div>
   );

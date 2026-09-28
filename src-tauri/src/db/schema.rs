@@ -75,6 +75,18 @@ pub fn migrate(conn: &Connection) -> Result<(), AppError> {
           created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_tombstones_time ON clear_tombstones(ts_from, ts_to);
+
+        -- 供应商名称快照：sync 时从 ZCode provider 配置（provider_config.json）
+        -- upsert 进来，只增不删——provider 从配置中删除后，其历史 ID 仍保留
+        -- 同步时捕获的名称。source: zcode_config | manual（manual 为后续扩展）。
+        CREATE TABLE IF NOT EXISTS provider_names (
+          provider_id   TEXT PRIMARY KEY,
+          display_name  TEXT NOT NULL,
+          source        TEXT NOT NULL DEFAULT 'zcode_config',
+          base_url      TEXT,
+          first_seen_at INTEGER NOT NULL,
+          updated_at    INTEGER NOT NULL
+        );
         "#,
     )?;
 

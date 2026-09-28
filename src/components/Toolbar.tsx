@@ -1,6 +1,7 @@
 import { Range } from "../lib/format";
 import { SyncStatus } from "../lib/api";
 import { ModelSel, ScopeFilter } from "../lib/api";
+import { ProviderNames } from "../lib/providerName";
 import { ScopeChips, scopeSummary } from "./ScopePicker";
 
 const RANGES: { id: Range; label: string }[] = [
@@ -13,6 +14,7 @@ export function Toolbar(props: {
   range: Range; onRange: (r: Range) => void;
   status: SyncStatus | null; onRefresh: () => void; loading: boolean;
   scope: ScopeFilter;
+  names: ProviderNames;
   onOpenScope: () => void;
   onRemoveScopeProvider: (p: string) => void;
   onRemoveScopeModel: (m: ModelSel) => void;
@@ -52,6 +54,7 @@ export function Toolbar(props: {
       </button>
       <ScopeChips
         selected={props.scope}
+        names={props.names}
         onRemoveProvider={props.onRemoveScopeProvider}
         onRemoveModel={props.onRemoveScopeModel}
         onClear={props.onClearScope}

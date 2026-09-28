@@ -1,5 +1,6 @@
 use crate::error::AppError;
-use crate::pricing::ModelPricing;
+use crate::pricing::{override_lookup, ModelPricing};
+use crate::zcode::provider_names::ProviderName;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use rust_decimal::Decimal;
@@ -462,6 +463,9 @@ pub struct OverrideRow {
     pub output: String,
     pub cache_read: String,
     pub cache_creation: String,
+    /// 该覆盖当前按归一化口径命中的记录数（与 resolve 的 override_lookup
+    /// 完全同口径计算；0 表示覆盖不生效，前端应红字提示）。
+    pub matched_count: i64,
 }
 
 pub fn get_overrides(conn: &Connection) -> Result<HashMap<(String, String), ModelPricing>, AppError> {
@@ -497,18 +501,59 @@ pub fn list_overrides(conn: &Connection) -> Result<Vec<OverrideRow>, AppError> {
          FROM pricing_overrides ORDER BY provider_id, model_id",
     )?;
     let it = stmt.query_map([], |row| {
-        Ok(OverrideRow {
-            provider_id: row.get(0)?,
-            model_id: row.get(1)?,
-            input: row.get(2)?,
-            output: row.get(3)?,
-            cache_read: row.get(4)?,
-            cache_creation: row.get(5)?,
-        })
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
     })?;
     let mut out = Vec::new();
-    for r in it { out.push(r?); }
+    for r in it {
+        let (pid, mid, i, o, cr, cc) = r?;
+        // 命中数必须用与 resolve 相同的 override_lookup 计算（口径唯一）：
+        // 以该覆盖为唯一覆盖项，判定该 provider 下每个 DISTINCT model_id 是否命中。
+        let matched_count = match ModelPricing::from_strings(&i, &o, &cr, &cc) {
+            Ok(p) => {
+                let mut single = HashMap::new();
+                single.insert((pid.clone(), mid.clone()), p);
+                count_matched_records(conn, &pid, &single)?
+            }
+            Err(_) => 0, // 单价损坏的覆盖不会在 resolve 中生效，视为 0 命中
+        };
+        out.push(OverrideRow {
+            provider_id: pid,
+            model_id: mid,
+            input: i,
+            output: o,
+            cache_read: cr,
+            cache_creation: cc,
+            matched_count,
+        });
+    }
     Ok(out)
+}
+
+/// 某覆盖（以单覆盖 map 表达）按 `override_lookup` 口径当前命中的记录总数。
+fn count_matched_records(
+    conn: &Connection,
+    provider_id: &str,
+    single: &HashMap<(String, String), ModelPricing>,
+) -> Result<i64, AppError> {
+    let mut total = 0i64;
+    for m in list_models_for_provider(conn, provider_id)? {
+        if override_lookup(provider_id, &m, single).is_some() {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM usage_records WHERE provider_id = ?1 AND model_id = ?2",
+                params![provider_id, m],
+                |r| r.get(0),
+            )?;
+            total += n;
+        }
+    }
+    Ok(total)
 }
 
 pub fn set_override(conn: &Connection, provider_id: &str, model_id: &str, p: &ModelPricing) -> Result<(), AppError> {
@@ -538,20 +583,120 @@ pub fn delete_override(conn: &Connection, provider_id: &str, model_id: &str) -> 
     Ok(())
 }
 
-/// 清空某 `(provider_id, model_id)` 组合的成本并置 `priced = 0`，返回受影响行数。
-/// 删除覆盖后调用：让这些行重新按当前定价来源（表价或未定价）回填，避免残留覆盖价。
-pub fn clear_pricing_by_provider_model(
+/// 某供应商下出现过的全部 DISTINCT `model_id`（按模型排序）。
+/// 覆盖重算 / 删除清理 / 命中数统计共用：先用 `override_lookup` 判定命中再逐个取行。
+pub fn list_models_for_provider(conn: &Connection, provider_id: &str) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT model_id FROM usage_records WHERE provider_id = ?1 ORDER BY model_id",
+    )?;
+    let it = stmt.query_map(params![provider_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
+}
+
+/// 清空某供应商下一组模型的成本并置 `priced = 0`，返回受影响行数。
+/// 调用方负责先用 `override_lookup`（归一化口径）选出要清空的 model_id 集合，
+/// 本函数只做清空，不含匹配逻辑。
+pub fn clear_pricing_by_models(
+    conn: &Connection, provider_id: &str, model_ids: &[String],
+) -> Result<usize, AppError> {
+    let mut total = 0usize;
+    for m in model_ids {
+        total += conn.execute(
+            "UPDATE usage_records SET
+                input_cost_usd='0', output_cost_usd='0',
+                cache_read_cost_usd='0', cache_creation_cost_usd='0',
+                total_cost_usd='0', priced=0
+             WHERE provider_id = ?1 AND model_id = ?2",
+            params![provider_id, m],
+        )?;
+    }
+    Ok(total)
+}
+
+/// 删除「供应商 + 模型」的覆盖，并清空其影响范围内行的成本（置 `priced = 0`），
+/// 返回清空的行数。
+///
+/// 影响范围用与 resolve 完全相同的 `override_lookup` 归一化口径确定：以被删覆盖
+/// 为唯一覆盖项，判定该 provider 下每个 DISTINCT model_id 是否命中——避免
+/// 「删了覆盖、成本还留着覆盖价」，也避免误清其它覆盖定价的行。
+/// 删除后由调用方触发 sync 回填表价 / 未定价。
+pub fn delete_override_and_clear(
     conn: &Connection, provider_id: &str, model_id: &str,
 ) -> Result<usize, AppError> {
-    let n = conn.execute(
-        "UPDATE usage_records SET
-            input_cost_usd='0', output_cost_usd='0',
-            cache_read_cost_usd='0', cache_creation_cost_usd='0',
-            total_cost_usd='0', priced=0
-         WHERE provider_id = ?1 AND model_id = ?2",
-        params![provider_id, model_id],
+    // 删除前先取该覆盖的价格，构造单覆盖 map 用于归一化匹配其影响范围。
+    let all = get_overrides(conn)?;
+    let mut removed: HashMap<(String, String), ModelPricing> = HashMap::new();
+    if let Some(p) = all.get(&(provider_id.to_string(), model_id.to_string())) {
+        removed.insert((provider_id.to_string(), model_id.to_string()), p.clone());
+    }
+    delete_override(conn, provider_id, model_id)?;
+    if removed.is_empty() {
+        return Ok(0); // 覆盖不存在或单价损坏（不会生效），无需清理
+    }
+    let models = list_models_for_provider(conn, provider_id)?;
+    let matched: Vec<String> = models
+        .into_iter()
+        .filter(|m| override_lookup(provider_id, m, &removed).is_some())
+        .collect();
+    clear_pricing_by_models(conn, provider_id, &matched)
+}
+
+// ---------------------------------------------------------------------------
+// 供应商名称快照（Issue P1-A：providerId → 可读名称）
+// ---------------------------------------------------------------------------
+
+/// 供 UI 展示的供应商名称行（`first_seen_at`/`updated_at` 不暴露给前端）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderNameRow {
+    pub provider_id: String,
+    pub display_name: String,
+    pub source: String,
+    pub base_url: Option<String>,
+}
+
+/// 快照供应商名称到自有库（只增不删：已从 ZCode 配置中消失的 provider
+/// 绝不删除，其历史数据仍保留同步时捕获的名称）。
+///
+/// 冲突时更新 `display_name`/`base_url`/`updated_at`，`first_seen_at` 保留；
+/// `source` 固定写 `zcode_config`。
+pub fn upsert_provider_names(
+    conn: &Connection,
+    names: &[ProviderName],
+) -> Result<(), AppError> {
+    let now = chrono::Utc::now().timestamp_millis();
+    for n in names {
+        conn.execute(
+            "INSERT INTO provider_names (provider_id, display_name, source, base_url, first_seen_at, updated_at)
+             VALUES (?1, ?2, 'zcode_config', ?3, ?4, ?4)
+             ON CONFLICT(provider_id) DO UPDATE SET
+               display_name = excluded.display_name,
+               base_url = excluded.base_url,
+               updated_at = excluded.updated_at",
+            params![n.provider_id, n.display_name, n.base_url, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// 全部已知的供应商名称（供前端把 provider_id 显示为可读名称）。
+pub fn list_provider_names(conn: &Connection) -> Result<Vec<ProviderNameRow>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_id, display_name, source, base_url
+         FROM provider_names ORDER BY display_name, provider_id",
     )?;
-    Ok(n)
+    let it = stmt.query_map([], |row| {
+        Ok(ProviderNameRow {
+            provider_id: row.get(0)?,
+            display_name: row.get(1)?,
+            source: row.get(2)?,
+            base_url: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in it { out.push(r?); }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,8 +1388,9 @@ mod tests {
         delete_override(&c, "nope", "nope").unwrap();
     }
 
+    /// `clear_pricing_by_models`：只清指定供应商下指定模型的行，其它供应商/模型不受影响。
     #[test]
-    fn clear_pricing_resets_only_target_combo() {
+    fn clear_pricing_by_models_clears_targets_and_keeps_others() {
         let c = conn();
         let mut a = rec("a", "m1", 10);
         a.provider_id = "p1".into();
@@ -1256,8 +1402,8 @@ mod tests {
         insert_record(&c, &b).unwrap();
         insert_record(&c, &other).unwrap();
 
-        let n = clear_pricing_by_provider_model(&c, "p1", "m1").unwrap();
-        assert_eq!(n, 2, "应命中该组合 2 行");
+        let n = clear_pricing_by_models(&c, "p1", &["m1".to_string()]).unwrap();
+        assert_eq!(n, 2, "应命中 p1/m1 共 2 行");
 
         let logs = query_logs(&c, 0, i64::MAX, None, 100).unwrap();
         for id in ["a", "b"] {
@@ -1265,14 +1411,155 @@ mod tests {
             assert!(!row.priced, "{id} 应变为未定价");
             assert_eq!(row.total_cost_usd, "0");
         }
-        // 其它组合不受影响
+        // 其它供应商不受影响
         let other_row = logs.iter().find(|l| l.request_id == "c").unwrap();
         assert!(other_row.priced);
         assert_ne!(other_row.total_cost_usd, "0");
 
-        // 再次清空：已 priced=0，仍返回受影响行数（UPDATE 匹配行数）
-        assert_eq!(clear_pricing_by_provider_model(&c, "p1", "m1").unwrap(), 2);
-        assert_eq!(clear_pricing_by_provider_model(&c, "nope", "nope").unwrap(), 0);
+        // 已 priced=0 的行再次清空仍计入（UPDATE 匹配行数）；空列表清 0 行
+        assert_eq!(clear_pricing_by_models(&c, "p1", &["m1".to_string()]).unwrap(), 2);
+        assert_eq!(clear_pricing_by_models(&c, "p1", &[]).unwrap(), 0);
+        assert_eq!(clear_pricing_by_models(&c, "p1", &["nope".to_string()]).unwrap(), 0);
+    }
+
+    /// 删除覆盖按归一化口径清理：命名空间行与裸名行都被清空，其它模型不动。
+    #[test]
+    fn delete_override_and_clear_uses_normalized_matching() {
+        let c = conn();
+        let mut x = rec("x", "deepseek-ai/DeepSeek-V4.1-flash", 10);
+        x.provider_id = "p1".into();
+        let mut y = rec("y", "deepseek-v4.1-flash", 20);
+        y.provider_id = "p1".into();
+        let mut z = rec("z", "m2", 30);
+        z.provider_id = "p1".into();
+        let mut other_p = rec("w", "deepseek-v4.1-flash", 40);
+        other_p.provider_id = "p2".into();
+        insert_record(&c, &x).unwrap();
+        insert_record(&c, &y).unwrap();
+        insert_record(&c, &z).unwrap();
+        insert_record(&c, &other_p).unwrap();
+
+        set_override(&c, "p1", "deepseek-v4.1-flash", &override_price()).unwrap();
+        // 列表视图的命中数应为 2（x + y，跨命名空间同口径）
+        let rows = list_overrides(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].matched_count, 2, "覆盖应按归一化口径命中 2 行");
+
+        let n = delete_override_and_clear(&c, "p1", "deepseek-v4.1-flash").unwrap();
+        assert_eq!(n, 2, "命名空间行与裸名行都应被清空");
+        assert!(get_overrides(&c).unwrap().is_empty(), "覆盖行已删除");
+
+        let logs = query_logs(&c, 0, i64::MAX, None, 100).unwrap();
+        for id in ["x", "y"] {
+            let row = logs.iter().find(|l| l.request_id == id).unwrap();
+            assert!(!row.priced, "{id} 应变为未定价");
+            assert_eq!(row.total_cost_usd, "0");
+        }
+        // 其它模型与其它供应商不受影响
+        let z_row = logs.iter().find(|l| l.request_id == "z").unwrap();
+        assert!(z_row.priced, "其它模型不受影响");
+        let w_row = logs.iter().find(|l| l.request_id == "w").unwrap();
+        assert!(w_row.priced, "其它供应商不受影响");
+    }
+
+    /// 删除不存在的覆盖：清 0 行、不报错（成本不可能来自一个不生效的覆盖）。
+    #[test]
+    fn delete_override_and_clear_noop_for_missing_override() {
+        let c = conn();
+        insert_record(&c, &rec("a", "m1", 10)).unwrap();
+        let n = delete_override_and_clear(&c, "p1", "m1").unwrap();
+        assert_eq!(n, 0);
+        let row = &query_logs(&c, 0, i64::MAX, None, 100).unwrap()[0];
+        assert!(row.priced, "无覆盖可删时不得清空既有成本");
+    }
+
+    // -- P1-A：供应商名称快照 -------------------------------------------------
+
+    #[test]
+    fn upsert_provider_names_is_idempotent_and_keeps_gone_providers() {
+        let c = conn();
+        let names = vec![
+            pname("p1", "Provider One"),
+            pname("p2", "Provider Two"),
+        ];
+        upsert_provider_names(&c, &names).unwrap();
+        upsert_provider_names(&c, &names_iter(&c)).unwrap(); // 幂等：重复写同样数据
+        assert_eq!(list_provider_names(&c).unwrap().len(), 2, "重复 upsert 不应新增行");
+
+        // p2 从配置中消失 → 仍保留（只增不删）
+        upsert_provider_names(&c, &[pname("p1", "Provider One")]).unwrap();
+        let rows = list_provider_names(&c).unwrap();
+        assert_eq!(rows.len(), 2, "已消失的 provider 绝不删除");
+        assert!(rows.iter().any(|r| r.provider_id == "p2" && r.display_name == "Provider Two"));
+    }
+
+    #[test]
+    fn upsert_provider_names_updates_rename_and_keeps_first_seen() {
+        let c = conn();
+        upsert_provider_names(&c, &[pname("p1", "Old Name")]).unwrap();
+        // 伪造时间戳，验证 first_seen_at 保留、updated_at 更新
+        c.execute(
+            "UPDATE provider_names SET first_seen_at = 100, updated_at = 200 WHERE provider_id = 'p1'",
+            [],
+        ).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        upsert_provider_names(&c, &[pname("p1", "New Name")]).unwrap();
+
+        let rows = list_provider_names(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.display_name, "New Name", "改名后 display_name 应更新");
+        assert_eq!(r.source, "zcode_config");
+        let (first, updated): (i64, i64) = c.query_row(
+            "SELECT first_seen_at, updated_at FROM provider_names WHERE provider_id = 'p1'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(first, 100, "first_seen_at 必须保留");
+        assert!(updated > 200, "updated_at 应被更新为本次 upsert 时间");
+    }
+
+    #[test]
+    fn list_provider_names_orders_and_roundtrips() {
+        let c = conn();
+        let mut n1 = pname("b-id", "Zeta");
+        n1.base_url = Some("https://example.com/v1".into());
+        upsert_provider_names(&c, &[n1, pname("a-id", "Alpha")]).unwrap();
+        let rows = list_provider_names(&c).unwrap();
+        assert_eq!(rows.len(), 2);
+        // 按 display_name 排序
+        assert_eq!((rows[0].provider_id.as_str(), rows[0].display_name.as_str()), ("a-id", "Alpha"));
+        assert_eq!(rows[1].provider_id, "b-id");
+        assert_eq!(rows[1].base_url.as_deref(), Some("https://example.com/v1"));
+    }
+
+    fn override_price() -> ModelPricing {
+        ModelPricing {
+            input: Decimal::from_str("0.15").unwrap(),
+            output: Decimal::from_str("0.6").unwrap(),
+            cache_read: Decimal::from_str("0.003").unwrap(),
+            cache_creation: Decimal::ZERO,
+        }
+    }
+
+    fn pname(id: &str, name: &str) -> ProviderName {
+        ProviderName {
+            provider_id: id.into(),
+            display_name: name.into(),
+            base_url: None,
+        }
+    }
+
+    /// 辅助：把当前表内 provider_names 重复 upsert 一遍（取回再写，验证幂等）。
+    fn names_iter(c: &rusqlite::Connection) -> Vec<ProviderName> {
+        list_provider_names(c).unwrap()
+            .into_iter()
+            .map(|r| ProviderName {
+                provider_id: r.provider_id,
+                display_name: r.display_name,
+                base_url: r.base_url,
+            })
+            .collect()
     }
 
     #[test]
@@ -1352,7 +1639,7 @@ mod tests {
     /// 清除边界：时间倒置 / 供应商不存在 / 模型不属于供应商 / 范围无数据 / 模型不存在。
     #[test]
     fn clear_records_validates_boundary_conditions() {
-        let mut c = conn();
+        let c = conn();
         insert_record(&c, &rec("a", "m1", 100)).unwrap();
 
         // 开始时间晚于结束时间

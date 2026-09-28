@@ -1,11 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { PricingOverrideDialog, validatePrices } from "./PricingOverrideDialog";
+import { MatchedCount, PricingOverrideDialog, SaveNotice, validatePrices } from "./PricingOverrideDialog";
 
 describe("PricingOverrideDialog", () => {
   it("renders provider options, four price inputs and save button", () => {
     const html = renderToStaticMarkup(
-      <PricingOverrideDialog providers={["anthropic", "openai"]} onClose={() => {}} onChanged={() => {}} />,
+      <PricingOverrideDialog providers={["anthropic", "openai"]} names={{}} onClose={() => {}} onChanged={() => {}} />,
     );
     expect(html).toContain("定价覆盖");
     expect(html).toContain("供应商");
@@ -22,6 +22,60 @@ describe("PricingOverrideDialog", () => {
     expect(html).toContain('min="0"');
     // 无覆盖时的空态（SSR 不跑 effect，rows 初始为空）
     expect(html).toContain("暂无覆盖");
+  });
+
+  it("option value 仍为原始 provider_id，label 显示映射名称", () => {
+    const html = renderToStaticMarkup(
+      <PricingOverrideDialog
+        providers={["opencode-go-chat", "new-provider"]}
+        names={{ "opencode-go-chat": "OpenCode Go" }}
+        onClose={() => {}}
+        onChanged={() => {}}
+      />,
+    );
+    // 有映射：value = 原始 ID，label = 名称，title 保留原始 ID
+    expect(html).toContain('value="opencode-go-chat"');
+    expect(html).toContain('title="opencode-go-chat"');
+    expect(html).toContain(">OpenCode Go</option>");
+    // 无映射：label 回退原始 ID，不加 title
+    expect(html).toContain('<option value="new-provider">new-provider</option>');
+  });
+
+  it("覆盖列表表头含「命中记录数」列", () => {
+    const html = renderToStaticMarkup(
+      <PricingOverrideDialog providers={["p1"]} names={{}} onClose={() => {}} onChanged={() => {}} />,
+    );
+    expect(html).toContain("命中记录数");
+  });
+});
+
+describe("SaveNotice", () => {
+  it("repriced = 0 时显示琥珀色警示（覆盖未命中任何记录）", () => {
+    const html = renderToStaticMarkup(<SaveNotice repriced={0} />);
+    expect(html).toContain("已保存，但当前没有匹配的记录");
+    expect(html).toContain("请检查模型 ID 是否与用量记录一致");
+    expect(html).toContain("text-amber-600");
+  });
+
+  it("repriced > 0 时显示成功提示与重算条数", () => {
+    const html = renderToStaticMarkup(<SaveNotice repriced={42} />);
+    expect(html).toContain("已保存，已重算 42 条记录");
+    expect(html).toContain("text-green-600");
+    expect(html).not.toContain("text-amber-600");
+  });
+});
+
+describe("MatchedCount", () => {
+  it("0 命中时红字显示", () => {
+    const html = renderToStaticMarkup(<MatchedCount count={0} />);
+    expect(html).toContain("text-red-600");
+    expect(html).toContain(">0</span>");
+  });
+
+  it("有命中时正常显示", () => {
+    const html = renderToStaticMarkup(<MatchedCount count={1406} />);
+    expect(html).toContain("1406");
+    expect(html).not.toContain("text-red-600");
   });
 });
 

@@ -24,7 +24,7 @@ function row(over: Partial<RequestLogRow> = {}): RequestLogRow {
 
 describe("RequestLogTable", () => {
   it("renders all columns and row values including cache-read subline", () => {
-    const html = renderToStaticMarkup(<RequestLogTable rows={[row()]} />);
+    const html = renderToStaticMarkup(<RequestLogTable rows={[row()]} names={{}} />);
     for (const c of ["时间", "供应商", "计费模型", "输入", "输出", "总成本", "用时/首字", "状态", "来源"]) {
       expect(html).toContain(c);
     }
@@ -39,30 +39,48 @@ describe("RequestLogTable", () => {
     expect(html).toMatch(/\d\d\/\d\d \d\d:\d\d/);
   });
 
+  it("shows the mapped provider name and keeps the raw id in title", () => {
+    const html = renderToStaticMarkup(
+      <RequestLogTable rows={[row({ provider_id: "new-provider" })]} names={{ "new-provider": "OpenCode Go" }} />,
+    );
+    expect(html).toContain("OpenCode Go");
+    expect(html).toContain('title="new-provider"');
+    // 名称映射生效时，原始 ID 不应再作为可见文本出现（仅存在于 title）
+    expect(html).not.toContain(">new-provider<");
+  });
+
+  it("falls back to the raw provider_id without title when unmapped", () => {
+    const html = renderToStaticMarkup(
+      <RequestLogTable rows={[row({ provider_id: "new-provider" })]} names={{}} />,
+    );
+    expect(html).toContain("new-provider");
+    expect(html).not.toContain("title=");
+  });
+
   it("shows dash when query_source is null", () => {
-    const html = renderToStaticMarkup(<RequestLogTable rows={[row({ query_source: null })]} />);
+    const html = renderToStaticMarkup(<RequestLogTable rows={[row({ query_source: null })]} names={{}} />);
     expect(html).toContain("—");
   });
 
   it("shows dash for unpriced cost and when timings are null", () => {
     const html = renderToStaticMarkup(
-      <RequestLogTable rows={[row({ priced: false, duration_ms: null, first_token_ms: null })]} />,
+      <RequestLogTable rows={[row({ priced: false, duration_ms: null, first_token_ms: null })]} names={{}} />,
     );
     expect(html).toContain("—");
     expect(html).not.toContain("s /");
   });
 
   it("colors status by value", () => {
-    const done = renderToStaticMarkup(<RequestLogTable rows={[row({ status: "completed" })]} />);
-    const err = renderToStaticMarkup(<RequestLogTable rows={[row({ status: "error" })]} />);
-    const other = renderToStaticMarkup(<RequestLogTable rows={[row({ status: "pending" })]} />);
+    const done = renderToStaticMarkup(<RequestLogTable rows={[row({ status: "completed" })]} names={{}} />);
+    const err = renderToStaticMarkup(<RequestLogTable rows={[row({ status: "error" })]} names={{}} />);
+    const other = renderToStaticMarkup(<RequestLogTable rows={[row({ status: "pending" })]} names={{}} />);
     expect(done).toContain("text-green-600");
     expect(err).toContain("text-red-600");
     expect(other).toContain("text-gray-500");
   });
 
   it("renders empty state when no rows", () => {
-    const html = renderToStaticMarkup(<RequestLogTable rows={[]} />);
+    const html = renderToStaticMarkup(<RequestLogTable rows={[]} names={{}} />);
     expect(html).toContain("暂无数据");
   });
 });

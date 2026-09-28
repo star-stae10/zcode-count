@@ -1,5 +1,6 @@
 import { UnpricedModelRow } from "../lib/api";
 import { formatDateTime, formatTokens } from "../lib/format";
+import { ProviderNames, providerLabel } from "../lib/providerName";
 
 /**
  * 未定价模型清单：成本可信度警告的明细。
@@ -10,6 +11,7 @@ export function UnpricedDialog(props: {
   rows: UnpricedModelRow[];
   loading: boolean;
   error: string | null;
+  names: ProviderNames;
   onPriceModel: (providerId: string, modelId: string) => void;
   onClose: () => void;
 }) {
@@ -50,7 +52,9 @@ export function UnpricedDialog(props: {
             <tbody>
               {props.rows.map((r) => (
                 <tr key={`${r.provider_id}/${r.model_id}`} className="border-b border-gray-100">
-                  <td className="py-2 pr-4">{r.provider_id}</td>
+                  <td className="py-2 pr-4" title={props.names[r.provider_id] != null ? r.provider_id : undefined}>
+                    {providerLabel(props.names, r.provider_id)}
+                  </td>
                   <td className="py-2 pr-4">{r.model_id}</td>
                   <td className="py-2 pr-4">{r.request_count}</td>
                   <td className="py-2 pr-4">{formatTokens(r.total_tokens)}</td>

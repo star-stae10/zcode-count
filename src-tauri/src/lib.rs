@@ -23,6 +23,7 @@ pub fn run() {
             crate::commands::get_provider_stats,
             crate::commands::get_model_stats,
             crate::commands::list_provider_models,
+            crate::commands::list_provider_names,
             crate::commands::get_unpriced_models,
             crate::commands::preview_clear_usage,
             crate::commands::clear_usage,
